@@ -2,11 +2,10 @@
 """
 Bitrix24 → Whisper → Telegram monitor (real-time)
 
-Now enriched with:
+Enriched:
 - Contact info (Full Name + Phone) for each call
-- Transcript analysis results
-- Telegram alert message contains subscriber’s name + phone + analysis summary
-
+- Transcript preview
+- Telegram alert: subscriber’s name + phone + CRM link + analysis fragment
 """
 import os
 import json
@@ -28,6 +27,16 @@ LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 LANGUAGE_HINT = os.getenv("LANGUAGE_HINT", "uk")
 TIMEOUT = 60
 
+# Fail fast on critical env
+for k, v in {
+    "BITRIX_WEBHOOK_BASE": BITRIX_WEBHOOK_BASE,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "TG_BOT_TOKEN": TG_BOT_TOKEN,
+    "TG_CHAT_ID": TG_CHAT_ID,
+}.items():
+    if not v:
+        raise SystemExit(f"Missing env var {k}")
+
 if not BITRIX_WEBHOOK_BASE.endswith('/'):
     BITRIX_WEBHOOK_BASE += '/'
 
@@ -44,7 +53,6 @@ class CallItem:
     phone_number: t.Optional[str]
 
 # -------------------- Helpers --------------------
-
 def http_post_json(url: str, payload: dict) -> dict:
     resp = requests.post(url, json=payload, timeout=TIMEOUT)
     resp.raise_for_status()
@@ -56,13 +64,18 @@ def http_get_binary(url: str) -> bytes:
     return r.content
 
 # -------------------- Bitrix24 --------------------
-
 def b24_vox_get_total() -> int:
     url = f"{BITRIX_WEBHOOK_BASE}voximplant.statistic.get.json"
     data = {"ORDER": {"CALL_START_DATE": "DESC"}, "LIMIT": 1}
     js = http_post_json(url, data)
     res = js.get("result") or js
-    total = res.get("total") if isinstance(res, dict) else js.get("total")
+    total = None
+    if isinstance(res, dict):
+        total = res.get("total")
+    if total is None:
+        total = js.get("total")
+    if total is None:
+        raise RuntimeError(f"Can't find 'total' in response: {js}")
     return int(total)
 
 def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
@@ -72,11 +85,14 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
     data = {"ORDER": {"CALL_START_DATE": "DESC"}, "LIMIT": limit, "start": start}
     js = http_post_json(url, data)
     res = js.get("result") or js
+
     items: t.List[dict] = []
     if isinstance(res, dict):
         for v in res.values():
             if isinstance(v, dict) and "CALL_ID" in v:
                 items.append(v)
+        if not items and isinstance(res.get("items"), list):
+            items = res["items"]
     elif isinstance(res, list):
         items = res
 
@@ -98,12 +114,13 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
             )
         except Exception:
             continue
+    # Only calls with recording & duration>0
     result = [r for r in result if r.duration and r.duration > 0 and r.record_url]
+    # Newest first
     result = sorted(result, key=lambda x: x.call_start, reverse=True)[:limit]
     return result
 
-# CRM entity details (for Full Name)
-
+# -------------------- CRM helpers --------------------
 def _portal_base_from_webhook() -> str:
     try:
         return BITRIX_WEBHOOK_BASE.split('/rest/')[0].rstrip('/') + '/'
@@ -137,7 +154,7 @@ def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
         name = str(data.get("TITLE", "")).strip() or "—"
     return name
 
-def b24_entity_link(entity_type: str, entity_id: str, activity_id: str | None = None) -> str:
+def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[str] = None) -> str:
     base = _portal_base_from_webhook()
     et = (entity_type or '').upper()
     path_map = {
@@ -162,9 +179,13 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
 
 # -------------------- Telegram --------------------
 def tg_send_message(text: str) -> None:
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    requests.post(url, json=payload, timeout=TIMEOUT)
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=TIMEOUT)
+        r.raise_for_status()
+    except Exception:
+        traceback.print_exc()
 
 # -------------------- Script Checking --------------------
 def evaluate_transcript(transcript: str, rules: dict) -> str:
@@ -173,8 +194,9 @@ def evaluate_transcript(transcript: str, rules: dict) -> str:
 
 # -------------------- State --------------------
 def load_state() -> dict:
-    if pathlib.Path(STATE_FILE).exists():
-        return json.loads(pathlib.Path(STATE_FILE).read_text(encoding="utf-8"))
+    p = pathlib.Path(STATE_FILE)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
     return {}
 
 def save_state(st: dict):
@@ -185,37 +207,37 @@ def process():
     state = load_state()
     last_seen = state.get("last_seen_call_id")
     calls = b24_vox_get_latest(LIMIT_LAST)
+    if not calls:
+        return
     for c in calls:
         if c.call_id == last_seen:
             continue
-        audio = http_get_binary(c.record_url)
-        transcript = transcribe_whisper(audio, filename=f"{c.call_id}.mp3")
-        name = b24_get_entity_name(c.crm_entity_type, c.crm_entity_id)
-        phone = c.phone_number or "—"
-        preview = evaluate_transcript(transcript, {})
+        try:
+            audio = http_get_binary(c.record_url)
+            transcript = transcribe_whisper(audio, filename=f"{c.call_id}.mp3")
+            name = b24_get_entity_name(c.crm_entity_type, c.crm_entity_id)
+            phone = c.phone_number or "—"
+            preview = evaluate_transcript(transcript, {})
 
-        msg = (
-            f"☎️ <b>Новий дзвінок</b>
-"
-            f"<b>ПІБ:</b> {name}
-"
-            f"<b>Телефон:</b> {phone}
-"
-            f"<b>CRM:</b> <a href='{b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)}'>відкрити</a>
-"
-            f"<b>CALL_ID:</b> <code>{c.call_id}</code>
-"
-            f"<b>Початок:</b> {c.call_start}
-"
-            f"<b>Тривалість:</b> {c.duration}s
+            link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
+            msg = f"""☎️ <b>Новий дзвінок</b>
+<b>ПІБ:</b> {name}
+<b>Телефон:</b> {phone}
+<b>CRM:</b> <a href='{link}'>відкрити</a>
+<b>CALL_ID:</b> <code>{c.call_id}</code>
+<b>Початок:</b> {c.call_start}
+<b>Тривалість:</b> {c.duration}s
 
-"
-            f"<b>Аналіз (фрагмент 500):</b>
-<code>{preview}</code>"
-        )
-        tg_send_message(msg)
-        state["last_seen_call_id"] = c.call_id
-        save_state(state)
+<b>Аналіз (фрагмент 500):</b>
+<code>{preview}</code>"""
+
+            tg_send_message(msg)
+
+            state["last_seen_call_id"] = c.call_id
+            save_state(state)
+        except Exception:
+            traceback.print_exc()
+            tg_send_message(f"🚨 Помилка обробки CALL_ID <code>{c.call_id}</code>:\n<code>{traceback.format_exc()[:3500]}</code>")
 
 if __name__ == "__main__":
     process()
