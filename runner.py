@@ -1,7 +1,5 @@
 import os, time, threading, traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-# імпортуємо твій процес з основного скрипта
 from bitrix24_whisper_telegram_monitor_v2 import process
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
@@ -13,7 +11,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
         else:
             self.send_response(404); self.end_headers()
-    def log_message(self, *a):  # тихий лог
+    def log_message(self, *_):  # тихий http.server
         return
 
 def start_health_server():
@@ -24,7 +22,7 @@ if __name__ == "__main__":
     start_health_server()
     while True:
         try:
-            process()  # один прохід монітора
+            process()
         except Exception:
             traceback.print_exc()
         time.sleep(POLL_INTERVAL)
