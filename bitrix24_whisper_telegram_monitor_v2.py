@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Bitrix24 → Whisper → Telegram monitor (real-time)
+Bitrix24 → Whisper → Telegram monitor (real-time, safe import)
 
-Enriched:
-- Contact info (Full Name + Phone) for each call
-- Transcript preview
-- Telegram alert: subscriber’s name + phone + CRM link + analysis fragment
+- Pulls latest calls from Bitrix24 (voximplant.statistic.get via total→start)
+- Downloads recording, transcribes with Whisper (OpenAI)
+- Enriches with CRM (name, phone, deeplink to activity/card)
+- Sends Telegram alert with PІБ + phone + CRM link + transcript preview
+- **Safe import**: no fail-fast at module import; env is validated inside process()
 """
 import os
 import json
@@ -27,17 +28,8 @@ LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 LANGUAGE_HINT = os.getenv("LANGUAGE_HINT", "uk")
 TIMEOUT = 60
 
-# Fail fast on critical env
-for k, v in {
-    "BITRIX_WEBHOOK_BASE": BITRIX_WEBHOOK_BASE,
-    "OPENAI_API_KEY": OPENAI_API_KEY,
-    "TG_BOT_TOKEN": TG_BOT_TOKEN,
-    "TG_CHAT_ID": TG_CHAT_ID,
-}.items():
-    if not v:
-        raise SystemExit(f"Missing env var {k}")
-
-if not BITRIX_WEBHOOK_BASE.endswith('/'):
+# do not fail-fast here; runner's health must come up first
+if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith('/'):
     BITRIX_WEBHOOK_BASE += '/'
 
 @dataclass
@@ -53,10 +45,12 @@ class CallItem:
     phone_number: t.Optional[str]
 
 # -------------------- Helpers --------------------
+
 def http_post_json(url: str, payload: dict) -> dict:
     resp = requests.post(url, json=payload, timeout=TIMEOUT)
     resp.raise_for_status()
     return resp.json()
+
 
 def http_get_binary(url: str) -> bytes:
     r = requests.get(url, timeout=TIMEOUT)
@@ -64,6 +58,7 @@ def http_get_binary(url: str) -> bytes:
     return r.content
 
 # -------------------- Bitrix24 --------------------
+
 def b24_vox_get_total() -> int:
     url = f"{BITRIX_WEBHOOK_BASE}voximplant.statistic.get.json"
     data = {"ORDER": {"CALL_START_DATE": "DESC"}, "LIMIT": 1}
@@ -77,6 +72,7 @@ def b24_vox_get_total() -> int:
     if total is None:
         raise RuntimeError(f"Can't find 'total' in response: {js}")
     return int(total)
+
 
 def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
     total = b24_vox_get_total()
@@ -121,11 +117,13 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
     return result
 
 # -------------------- CRM helpers --------------------
+
 def _portal_base_from_webhook() -> str:
     try:
         return BITRIX_WEBHOOK_BASE.split('/rest/')[0].rstrip('/') + '/'
     except Exception:
         return BITRIX_WEBHOOK_BASE
+
 
 def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
     if not entity_type or not entity_id:
@@ -154,6 +152,7 @@ def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
         name = str(data.get("TITLE", "")).strip() or "—"
     return name
 
+
 def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[str] = None) -> str:
     base = _portal_base_from_webhook()
     et = (entity_type or '').upper()
@@ -169,6 +168,7 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
     return f"{base}{path}{entity_id}/" if path and entity_id else base
 
 # -------------------- Whisper --------------------
+
 def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -178,6 +178,7 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     return r.json().get("text", "").strip()
 
 # -------------------- Telegram --------------------
+
 def tg_send_message(text: str) -> None:
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -188,24 +189,42 @@ def tg_send_message(text: str) -> None:
         traceback.print_exc()
 
 # -------------------- Script Checking --------------------
+
 def evaluate_transcript(transcript: str, rules: dict) -> str:
     # Simplified: just return first 500 chars for now
     return transcript[:500]
 
 # -------------------- State --------------------
+
 def load_state() -> dict:
     p = pathlib.Path(STATE_FILE)
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
     return {}
 
+
 def save_state(st: dict):
     pathlib.Path(STATE_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
+# -------------------- Env check --------------------
+
+def _require_env(name: str) -> bool:
+    val = os.getenv(name, "")
+    if not val:
+        print(f"[monitor] WARN missing env {name}", flush=True)
+        return False
+    return True
+
 # -------------------- Main --------------------
+
 def process():
+    # Soft env validation (so runner's /health still works)
+    if not all(_require_env(n) for n in ["BITRIX_WEBHOOK_BASE","OPENAI_API_KEY","TG_BOT_TOKEN","TG_CHAT_ID"]):
+        return
+
     state = load_state()
     last_seen = state.get("last_seen_call_id")
+
     calls = b24_vox_get_latest(LIMIT_LAST)
     if not calls:
         return
@@ -238,6 +257,7 @@ def process():
         except Exception:
             traceback.print_exc()
             tg_send_message(f"🚨 Помилка обробки CALL_ID <code>{c.call_id}</code>:\n<code>{traceback.format_exc()[:3500]}</code>")
+
 
 if __name__ == "__main__":
     process()
