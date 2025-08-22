@@ -3,9 +3,9 @@
 Bitrix24 → Whisper → Telegram monitor (real-time, safe import)
 
 - Тягне останні дзвінки з Bitrix24 (voximplant.statistic.get через total→start)
-- Скачує запис, транскрибує Whisper'ом (OpenAI) з фіксом мови uk
-- Аналізує дзвінок за 8 критеріями (gpt-4o-mini)
-- Шле у Telegram: короткий підсумок у першому рядку + чек‑лист (без сирого фрагмента)
+- Скачує запис, транскрибує Whisper'ом (OpenAI) з фіксом мови uk та підказкою
+- ОДИН запит до OpenAI (chat): чек‑лист 8 критеріїв + коротке резюме у JSON
+- Шле у Telegram: короткий підсумок у першому рядку + структурований аналіз
 - Без fail‑fast на імпорті: секрети перевіряються всередині process()
 """
 
@@ -25,9 +25,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
+
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-TIMEOUT = 60
+TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
+
+# обмежуємо довжину транскрипту для економії токенів (0 = не різати)
+MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "7000"))
 
 # не валимо імпорт; лише нормалізуємо base
 if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith('/'):
@@ -194,24 +198,27 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     r.raise_for_status()
     return r.json().get("text", "").strip()
 
-# -------------------- OpenAI: Checklist analysis --------------------
-def analyze_transcript(transcript: str) -> str:
+# -------------------- OpenAI: One-shot analysis + summary --------------------
+def analyze_and_summarize(transcript: str) -> tuple[str, str]:
     """
-    Повертає структурований чек‑лист за 8 критеріями українською.
-    Формат відповіді — короткі рядки з емодзі (✅/⚠️/❌) та стислим поясненням.
+    Один запит до OpenAI: повертає (html_checklist, html_summary).
+    Модель відповідає у JSON, ми парсимо та екрануємо в HTML.
     """
     if not transcript:
-        return "Немає транскрипту для аналізу."
+        return ("Немає транскрипту для аналізу.", "Немає даних для резюме.")
+
+    # (опційно) скорочуємо надто великі транскрипти для економії токенів
+    if MAX_TRANSCRIPT_CHARS > 0 and len(transcript) > MAX_TRANSCRIPT_CHARS:
+        transcript = transcript[:MAX_TRANSCRIPT_CHARS] + " …(урізано для економії токенів)"
 
     system = (
-        "Ти — аналітик якості кол-центру. Оцінюй стисло, по суті, українською."
-        " Виводь тільки список з 8 пунктів, кожен з емодзі-статусом і коротким поясненням."
+        "Ти — аналітик якості кол-центру. Пиши українською. "
+        "Поверни СТРОГИЙ JSON з двома полями: "
+        '{"checklist": [...8 коротких пунктів з емодзі, по одному рядку], "summary": "1-2 речення про суть розмови" }. '
+        "Жодного іншого тексту поза JSON."
     )
     user = f"""
-Проаналізуй розмову за 8 критеріями. Для кожного — один рядок:
-<емодзі статусу> <Назва критерію>: <дуже коротке пояснення або приклад фрази>
-
-Використовуй ці критерії (в цій самій послідовності):
+Оціни розмову за 8 критеріями (у цій послідовності) і дай стислий підсумок:
 1. Привітання по скрипту (представився).
 2. З’ясування суті звернення.
 3. Ввічливість і емпатія.
@@ -221,28 +228,67 @@ def analyze_transcript(transcript: str) -> str:
 7. Допомога наприкінці / upsell.
 8. Коректне завершення (подякував).
 
+Формат JSON (строго):
+{{
+  "checklist": [
+    "✅ Привітання по скрипту: ...",
+    "⚠️ З’ясування суті звернення: ...",
+    "✅ Ввічливість і емпатія: ...",
+    "✅ Не перебивав: ...",
+    "❌ Рішення: ...",
+    "⚠️ Наступні дії або строки: ...",
+    "❌ Допомога/upsell: ...",
+    "✅ Завершення: ..."
+  ],
+  "summary": "1-2 речення без оцінок, лише суть розмови."
+}}
+
 Транскрипт:
 ---
 {transcript}
----"""
+---
+"""
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": OPENAI_CHAT_MODEL,
+        "model": OPENAI_CHAT_MODEL,  # напр. gpt-4o-mini
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         "max_tokens": 700,
         "temperature": 0.2,
+        "response_format": {"type": "json_object"},
     }
     r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
     r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"].strip()
 
-    # Telegram HTML: екрануємо небезпечні символи
-    return html_escape(content)
+    try:
+        data = r.json()["choices"][0]["message"]["content"]
+        obj = json.loads(data)
+        checklist_items = obj.get("checklist", [])
+        summary = obj.get("summary", "")
+
+        # Склеїмо чек‑лист у HTML
+        if isinstance(checklist_items, list):
+            checklist_html = "\n".join(html_escape(line) for line in checklist_items)
+        else:
+            checklist_html = html_escape(str(checklist_items))
+        summary_html = html_escape(summary or "")
+
+        if not checklist_html:
+            checklist_html = "Немає даних по чек‑листу."
+        if not summary_html:
+            summary_html = "Немає короткого резюме."
+
+        return checklist_html, summary_html
+
+    except Exception:
+        # fallback — без JSON
+        content = r.json()["choices"][0]["message"]["content"]
+        safe = html_escape(content.strip())
+        return (safe, "Не вдалося отримати структуроване резюме (fallback).")
 
 # -------------------- Telegram --------------------
 def tg_send_message(text: str) -> None:
@@ -251,14 +297,14 @@ def tg_send_message(text: str) -> None:
     """
     try:
         if TG_BOT_TOKEN.startswith("sk-"):
+            # Захист від помилкового ключа
             print("[tg] ERROR: TG_BOT_TOKEN схожий на OpenAI ключ (sk-...). Замініть на токен BotFather.", flush=True)
             return
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
-        # Розбивка на шматки (ліміт 4096; запас — 3500)
         CHUNK = 3500
         parts = [text[i:i+CHUNK] for i in range(0, len(text), CHUNK)] or [text]
-        for idx, part in enumerate(parts, 1):
+        for part in parts:
             payload = {
                 "chat_id": TG_CHAT_ID,
                 "text": part,
@@ -316,13 +362,11 @@ def process():
             phone = c.phone_number or "—"
             link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
-            # 3) Аналітика чек‑листом
-            checklist = analyze_transcript(transcript)
+            # 3) Аналітика (чек‑лист + резюме) одним запитом
+            checklist_html, summary_html = analyze_and_summarize(transcript)
 
-            # 4) Хедер (для прев’ю) + тіло (без сирого фрагмента)
-            header = (
-                f"BOTR: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
-            )
+            # 4) Хедер (для прев’ю) + тіло
+            header = f"BOTR: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             body = (
                 f"<b>Новий дзвінок</b>\n"
                 f"<b>ПІБ:</b> {html_escape(name)}\n"
@@ -331,7 +375,8 @@ def process():
                 f"<b>CALL_ID:</b> <code>{html_escape(c.call_id)}</code>\n"
                 f"<b>Початок:</b> {html_escape(c.call_start)}\n"
                 f"<b>Тривалість:</b> {c.duration}s\n\n"
-                f"<b>Аналіз розмови:</b>\n{checklist}"
+                f"<b>Аналіз розмови:</b>\n{checklist_html}\n\n"
+                f"<b>Коротке резюме:</b> {summary_html}"
             )
             tg_send_message(f"{header}\n\n{body}")
 
