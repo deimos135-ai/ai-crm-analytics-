@@ -1,10 +1,7 @@
-import os, time, threading, traceback, sys
+# runner.py — ультра-мінімальний
+import os, time, threading, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Імпортуємо саме той модуль, де є process()
-from bitrix24_monitor_rt import process     # <-- якщо файл називається інакше, заміни імпорт!
-
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 PORT = int(os.getenv("PORT", "8080"))
 
 class Handler(BaseHTTPRequestHandler):
@@ -19,16 +16,13 @@ class Handler(BaseHTTPRequestHandler):
 def start_health_server():
     srv = HTTPServer(("", PORT), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"[runner] health server on :{PORT} (/health)", flush=True)
+    print(f"[sanity] health server on :{PORT} (/health)", flush=True)
 
 if __name__ == "__main__":
-    print("[runner] starting…", flush=True)
+    print("[sanity] starting...", flush=True)
     start_health_server()
+    i = 0
     while True:
-        try:
-            print("[runner] tick -> process()", flush=True)
-            process()
-            print("[runner] done, sleep", flush=True)
-        except Exception:
-            traceback.print_exc(); sys.stdout.flush()
-        time.sleep(POLL_INTERVAL)
+        print(f"[sanity] tick {i}", flush=True)
+        time.sleep(15)
+        i += 1
