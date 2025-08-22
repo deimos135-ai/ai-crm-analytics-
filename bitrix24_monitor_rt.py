@@ -170,12 +170,32 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
 # -------------------- Whisper --------------------
 
 def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
+    """
+    Force Ukrainian transcription (no auto-detect) and bias decoder with UA prompt.
+    """
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    files = {"file": (filename, audio_bytes, "audio/mpeg"), "model": (None, "whisper-1")}
-    r = requests.post(url, headers=headers, files=files, timeout=TIMEOUT)
+
+    # короткий україномовний прайм, щоб декодер не «скочувався» в ru
+    initial_prompt = (
+        "Транскрибуй українською мовою (uk). Дотримуйся української орфографії, "
+        "без російських літер і кальок. Приклади: «будь ласка», «зв'язок», «підключення», «номер». "
+        "Не змішуй українську та російську."
+    )
+
+    # language/prompt мають йти у form-data (поле data), файл — у files
+    files = {"file": (filename, audio_bytes, "audio/mpeg")}
+    data = {
+        "model": "whisper-1",
+        "language": (os.getenv("LANGUAGE_HINT") or "uk").strip().lower(),
+        "temperature": 0,
+        "prompt": initial_prompt,
+    }
+
+    r = requests.post(url, headers=headers, files=files, data=data, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json().get("text", "").strip()
+
 
 # -------------------- Telegram --------------------
 
@@ -238,8 +258,19 @@ def process():
             phone = c.phone_number or "—"
             preview = evaluate_transcript(transcript, {})
 
-            link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
-            msg = f"""☎️ <b>Новий дзвінок</b>
+   link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
+
+# Швидкий індикатор відповідності
+compliance = quick_compliance_hint(transcript)  # «Так»/«Ні»
+
+# 1-й рядок — компактний підсумок (видно в прев’ю списку чатів)
+header = (
+    f"BOTR: 📞 {name} | {phone} | ⏱{c.duration}s | "
+    f"⚠️Відхилення: {'Так' if compliance == 'Ні' else 'Ні'}"
+)
+
+# Основне тіло
+body = f"""<b>Новий дзвінок</b>
 <b>ПІБ:</b> {name}
 <b>Телефон:</b> {phone}
 <b>CRM:</b> <a href='{link}'>відкрити</a>
@@ -250,7 +281,8 @@ def process():
 <b>Аналіз (фрагмент 500):</b>
 <code>{preview}</code>"""
 
-            tg_send_message(msg)
+msg = f"{header}\n\n{body}"
+tg_send_message(msg)
 
             state["last_seen_call_id"] = c.call_id
             save_state(state)
