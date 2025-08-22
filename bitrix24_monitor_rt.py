@@ -3,6 +3,7 @@
 Bitrix24 → Whisper → Telegram monitor (real-time, weekly analytics, safe import)
 
 - Тягне останні дзвінки з Bitrix24 (voximplant.statistic.get через total→start)
+- Фільтрує тільки вхідні (або за env) + мінімальну тривалість
 - Скачує запис, транскрибує Whisper'ом (OpenAI) з фіксом мови uk та підказкою
 - ОДИН запит до OpenAI (chat): чек‑лист 8 критеріїв + коротке резюме + tag + score
 - Шле у Telegram: короткий підсумок у першому рядку + структурований аналіз
@@ -32,14 +33,23 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 
+# Мова для Whisper та підказка
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
-# обмежуємо довжину транскрипту для економії токенів (0 = не різати)
+# Обмежуємо довжину транскрипту для економії токенів (0 = не різати)
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "7000"))
 
-# Weekly report settings
+# -------------------- Фільтри витрат --------------------
+# Лише вхідні? (true/false)
+ONLY_INCOMING = (os.getenv("ONLY_INCOMING", "true").lower() == "true")
+# Мапа Bitrix: CALL_TYPE: 1 = incoming, 2 = outgoing (типово)
+INCOMING_CODE = os.getenv("INCOMING_CODE", "1")
+# Мінімальна тривалість у секундах (нижче — не транскрибувати)
+MIN_DURATION_SEC = int(os.getenv("MIN_DURATION_SEC", "10"))
+
+# -------------------- Weekly report settings --------------------
 WEEKLY_TZ = os.getenv("WEEKLY_TZ", "Europe/Kyiv")
 WEEKLY_REPORT_DAY = os.getenv("WEEKLY_REPORT_DAY", "Fri")   # Mon..Sun (strftime %a)
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "18"))
@@ -64,6 +74,7 @@ class CallItem:
     crm_entity_id: t.Optional[str]
     crm_activity_id: t.Optional[str]
     phone_number: t.Optional[str]
+    call_type: t.Optional[str]   # 1=incoming, 2=outgoing (рядок)
 
 # -------------------- Utils --------------------
 def html_escape(s: str) -> str:
@@ -133,13 +144,18 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
                     crm_entity_id=(it.get("CRM_ENTITY_ID") or None),
                     crm_activity_id=(it.get("CRM_ACTIVITY_ID") or None),
                     phone_number=(it.get("PHONE_NUMBER") or None),
+                    call_type=(str(it.get("CALL_TYPE")) if it.get("CALL_TYPE") not in (None, "", "empty") else None),
                 )
             )
         except Exception:
             continue
 
-    # Тільки дзвінки з записом і тривалістю > 0
-    result = [r for r in result if r.duration and r.duration > 0 and r.record_url]
+    # Тільки дзвінки з записом, тривалістю >= порога та (опційно) тільки вхідні
+    result = [
+        r for r in result
+        if (r.duration and r.duration >= MIN_DURATION_SEC and r.record_url)
+           and (not ONLY_INCOMING or (r.call_type == INCOMING_CODE))
+    ]
     # Найновіші першими
     result = sorted(result, key=lambda x: x.call_start, reverse=True)[:limit]
     return result
@@ -517,6 +533,16 @@ def _maybe_send_weekly_report():
     _save_weekly_state(st)
     _prune_old_calls()
 
+# -------------------- State --------------------
+def load_state() -> dict:
+    p = pathlib.Path(STATE_FILE)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {}
+
+def save_state(st: dict):
+    pathlib.Path(STATE_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+
 # -------------------- Main --------------------
 def process():
     # М’яка валідація секретів (щоб /health жив навіть без них)
@@ -588,16 +614,6 @@ def process():
 
     # 7) Можливо, час тижневого звіту
     _maybe_send_weekly_report()
-
-# -------------------- State (kept at end for clarity) --------------------
-def load_state() -> dict:
-    p = pathlib.Path(STATE_FILE)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {}
-
-def save_state(st: dict):
-    pathlib.Path(STATE_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
 if __name__ == "__main__":
     process()
