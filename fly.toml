@@ -24,6 +24,6 @@ primary_region = "waw"
 [env]
   POLL_INTERVAL_SECONDS = "60"
   ONLY_INCOMING = "true"
-  INCOMING_CODE = "1"        # 1=incoming, 2=outgoing (за Bitrix)
+  INCOMING_CODE = "2"        # 1=incoming, 2=outgoing (за Bitrix)
   MIN_DURATION_SEC = "12"    # ігноруємо дуже короткі
 
