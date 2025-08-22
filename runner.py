@@ -1,6 +1,7 @@
+# runner.py
 import os, time, threading, traceback, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from bitrix24_monitor_rt import process
+from bitrix24_monitor_rt import process  # ← імпорт оновленої версії
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
 PORT = int(os.getenv("PORT", "8080"))
