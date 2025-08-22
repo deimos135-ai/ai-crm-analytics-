@@ -1,7 +1,9 @@
-import os, time, threading, traceback, sys, importlib
+import os, time, threading, traceback, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-MODULE_NAME = "bitrix24_monitor_rt"  # якщо файл з процесом названий інакше — замініть тут
+# Імпортуємо саме той модуль, де є process()
+from bitrix24_monitor_rt import process     # <-- якщо файл називається інакше, заміни імпорт!
+
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -19,28 +21,14 @@ def start_health_server():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"[runner] health server on :{PORT} (/health)", flush=True)
 
-def load_process():
-    try:
-        m = importlib.import_module(MODULE_NAME)
-        print(f"[runner] imported {MODULE_NAME}", flush=True)
-        return getattr(m, "process", None)
-    except Exception:
-        print("[runner] import failed:", flush=True)
-        traceback.print_exc(); sys.stdout.flush()
-        return None
-
 if __name__ == "__main__":
     print("[runner] starting…", flush=True)
     start_health_server()
     while True:
         try:
-            print("[runner] tick -> import & process()", flush=True)
-            process = load_process()
-            if process:
-                process()
-                print("[runner] done, sleep", flush=True)
-            else:
-                print("[runner] no process(); will retry", flush=True)
+            print("[runner] tick -> process()", flush=True)
+            process()
+            print("[runner] done, sleep", flush=True)
         except Exception:
             traceback.print_exc(); sys.stdout.flush()
         time.sleep(POLL_INTERVAL)
