@@ -1,9 +1,10 @@
-# runner.py
 import os, time, threading, traceback, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from bitrix24_monitor_rt import process  # ← імпорт оновленої версії
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
+# Імпортуємо саме той модуль, де є process()
+from bitrix24_monitor_rt import process     # <-- якщо файл називається інакше, заміни імпорт!
+
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 PORT = int(os.getenv("PORT", "8080"))
 
 class Handler(BaseHTTPRequestHandler):
@@ -12,7 +13,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
         else:
             self.send_response(404); self.end_headers()
-    def log_message(self, *_):  # тихий http.server
+    def log_message(self, *_):
         return
 
 def start_health_server():
