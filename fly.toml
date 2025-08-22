@@ -1,4 +1,4 @@
-app = "ai-analytics"
+app = "ai-analytics-"
 primary_region = "waw"
 
 [build]
