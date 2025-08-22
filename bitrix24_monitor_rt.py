@@ -3,9 +3,9 @@
 Bitrix24 → Whisper → Telegram monitor (real-time, safe import)
 
 - Тягне останні дзвінки з Bitrix24 (voximplant.statistic.get через total→start)
-- Скачує запис, транскрибує Whisper'ом (OpenAI)
-- Бере ПІБ/посилання з CRM
-- Шле у Telegram: короткий підсумок у першому рядку + детальна карточка з фрагментом
+- Скачує запис, транскрибує Whisper'ом (OpenAI) з фіксом мови uk
+- Аналізує дзвінок за 8 критеріями (gpt-4o-mini)
+- Шле у Telegram: короткий підсумок у першому рядку + чек‑лист (без сирого фрагмента)
 - Без fail‑fast на імпорті: секрети перевіряються всередині process()
 """
 
@@ -20,13 +20,13 @@ import requests
 
 # -------------------- Config --------------------
 STATE_FILE = os.getenv("STATE_FILE", "b24_monitor_state.json")
-SCRIPT_RULES_FILE = os.getenv("SCRIPT_RULES_FILE", "script_rules.json")
 BITRIX_WEBHOOK_BASE = os.getenv("BITRIX_WEBHOOK_BASE", "")  # must end with '/'
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
-LANGUAGE_HINT = os.getenv("LANGUAGE_HINT", "uk")
+LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 TIMEOUT = 60
 
 # не валимо імпорт; лише нормалізуємо base
@@ -45,7 +45,10 @@ class CallItem:
     crm_activity_id: t.Optional[str]
     phone_number: t.Optional[str]
 
-# -------------------- Helpers --------------------
+# -------------------- Utils --------------------
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def http_post_json(url: str, payload: dict) -> dict:
     resp = requests.post(url, json=payload, timeout=TIMEOUT)
     resp.raise_for_status()
@@ -137,7 +140,6 @@ def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
     try:
         js = http_post_json(f"{BITRIX_WEBHOOK_BASE}{method}", {"ID": str(entity_id)})
     except requests.HTTPError as e:
-        # м’яко логнемо і повернемо дефолт
         code = e.response.status_code if e.response is not None else "?"
         print(f"[b24] name fetch failed {code}: {e}", flush=True)
         return "—"
@@ -166,7 +168,7 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
     path = path_map.get(et)
     return f"{base}{path}{entity_id}/" if path and entity_id else base
 
-# -------------------- Whisper --------------------
+# -------------------- OpenAI: Whisper --------------------
 def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     """
     Фіксуємо українську мову та даємо україномовний підказуючий prompt.
@@ -180,11 +182,10 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
         "«підключення», «номер». Не змішуй українську та російську."
     )
 
-    # language/prompt передаємо в 'data', файл — у 'files'
     files = {"file": (filename, audio_bytes, "audio/mpeg")}
     data = {
         "model": "whisper-1",
-        "language": (LANGUAGE_HINT or "uk").strip().lower(),
+        "language": LANGUAGE_HINT,
         "temperature": 0,
         "prompt": initial_prompt,
     }
@@ -193,34 +194,83 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     r.raise_for_status()
     return r.json().get("text", "").strip()
 
+# -------------------- OpenAI: Checklist analysis --------------------
+def analyze_transcript(transcript: str) -> str:
+    """
+    Повертає структурований чек‑лист за 8 критеріями українською.
+    Формат відповіді — короткі рядки з емодзі (✅/⚠️/❌) та стислим поясненням.
+    """
+    if not transcript:
+        return "Немає транскрипту для аналізу."
+
+    system = (
+        "Ти — аналітик якості кол-центру. Оцінюй стисло, по суті, українською."
+        " Виводь тільки список з 8 пунктів, кожен з емодзі-статусом і коротким поясненням."
+    )
+    user = f"""
+Проаналізуй розмову за 8 критеріями. Для кожного — один рядок:
+<емодзі статусу> <Назва критерію>: <дуже коротке пояснення або приклад фрази>
+
+Використовуй ці критерії (в цій самій послідовності):
+1. Привітання по скрипту (представився).
+2. З’ясування суті звернення.
+3. Ввічливість і емпатія.
+4. Не перебивав, не агресивний тон.
+5. Правильність відповіді / рішення.
+6. Наступні дії або строки.
+7. Допомога наприкінці / upsell.
+8. Коректне завершення (подякував).
+
+Транскрипт:
+---
+{transcript}
+---"""
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": 700,
+        "temperature": 0.2,
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"].strip()
+
+    # Telegram HTML: екрануємо небезпечні символи
+    return html_escape(content)
+
 # -------------------- Telegram --------------------
 def tg_send_message(text: str) -> None:
+    """
+    Відправляє повідомлення. Якщо довше за ~3500 символів — ріже на частини.
+    """
     try:
         if TG_BOT_TOKEN.startswith("sk-"):
             print("[tg] ERROR: TG_BOT_TOKEN схожий на OpenAI ключ (sk-...). Замініть на токен BotFather.", flush=True)
             return
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.post(url, json=payload, timeout=TIMEOUT)
-        if r.status_code >= 400:
-            print(f"[tg] sendMessage {r.status_code}: {r.text[:300]}", flush=True)
-        r.raise_for_status()
+
+        # Розбивка на шматки (ліміт 4096; запас — 3500)
+        CHUNK = 3500
+        parts = [text[i:i+CHUNK] for i in range(0, len(text), CHUNK)] or [text]
+        for idx, part in enumerate(parts, 1):
+            payload = {
+                "chat_id": TG_CHAT_ID,
+                "text": part,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            r = requests.post(url, json=payload, timeout=TIMEOUT)
+            if r.status_code >= 400:
+                print(f"[tg] sendMessage {r.status_code}: {r.text[:300]}", flush=True)
+            r.raise_for_status()
     except Exception:
         traceback.print_exc()
-
-# -------------------- Simple checks --------------------
-def evaluate_transcript(transcript: str, rules: dict) -> str:
-    # Поки що: фрагмент 500 символів
-    return (transcript or "")[:500]
-
-def quick_compliance_hint(text: str) -> str:
-    """
-    Дуже проста евристика (заглушка): якщо є ввічливе привітання українською — «Так», інакше «Ні».
-    Далі замінимо на реальну перевірку сценарію.
-    """
-    t = (text or "").lower()
-    good = any(kw in t for kw in ("доброго дня", "добрий день", "вітаю"))
-    return "Так" if good else "Ні"
 
 # -------------------- State --------------------
 def load_state() -> dict:
@@ -257,45 +307,43 @@ def process():
         if c.call_id == last_seen:
             continue
         try:
+            # 1) Аудіо → транскрипція
             audio = http_get_binary(c.record_url)
             transcript = transcribe_whisper(audio, filename=f"{c.call_id}.mp3")
+
+            # 2) Ім'я/посилання/номер
             name = b24_get_entity_name(c.crm_entity_type, c.crm_entity_id)
             phone = c.phone_number or "—"
-            preview = evaluate_transcript(transcript, {})
             link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
-            # Індикатор відповідності (проста евристика)
-            compliance = quick_compliance_hint(transcript)  # «Так»/«Ні»
+            # 3) Аналітика чек‑листом
+            checklist = analyze_transcript(transcript)
 
-            # Перший рядок — короткий підсумок (видно в прев’ю списку чатів)
+            # 4) Хедер (для прев’ю) + тіло (без сирого фрагмента)
             header = (
-                f"BOTR: 📞 {name} | {phone} | ⏱{c.duration}s | "
-                f"⚠️Відхилення: {'Так' if compliance == 'Ні' else 'Ні'}"
+                f"BOTR: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             )
+            body = (
+                f"<b>Новий дзвінок</b>\n"
+                f"<b>ПІБ:</b> {html_escape(name)}\n"
+                f"<b>Телефон:</b> {html_escape(phone)}\n"
+                f"<b>CRM:</b> <a href='{html_escape(link)}'>відкрити</a>\n"
+                f"<b>CALL_ID:</b> <code>{html_escape(c.call_id)}</code>\n"
+                f"<b>Початок:</b> {html_escape(c.call_start)}\n"
+                f"<b>Тривалість:</b> {c.duration}s\n\n"
+                f"<b>Аналіз розмови:</b>\n{checklist}"
+            )
+            tg_send_message(f"{header}\n\n{body}")
 
-            # Детальна карточка
-            body = f"""<b>Новий дзвінок</b>
-<b>ПІБ:</b> {name}
-<b>Телефон:</b> {phone}
-<b>CRM:</b> <a href='{link}'>відкрити</a>
-<b>CALL_ID:</b> <code>{c.call_id}</code>
-<b>Початок:</b> {c.call_start}
-<b>Тривалість:</b> {c.duration}s
-
-<b>Аналіз (фрагмент 500):</b>
-<code>{preview}</code>"""
-
-            msg = f"{header}\n\n{body}"
-            tg_send_message(msg)
-
+            # 5) Маркуємо як оброблений
             state["last_seen_call_id"] = c.call_id
             save_state(state)
 
         except Exception:
             traceback.print_exc()
             tg_send_message(
-                f"🚨 Помилка обробки CALL_ID <code>{c.call_id}</code>:\n"
-                f"<code>{traceback.format_exc()[:3500]}</code>"
+                f"🚨 Помилка обробки CALL_ID <code>{html_escape(c.call_id)}</code>:\n"
+                f"<code>{html_escape(traceback.format_exc()[:3500])}</code>"
             )
 
 if __name__ == "__main__":
