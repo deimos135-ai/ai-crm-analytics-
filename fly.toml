@@ -22,5 +22,5 @@ primary_region = "waw"
     path = "/health"
 
 [env]
-  POLL_INTERVAL_SECONDS = "180"
+  POLL_INTERVAL_SECONDS = "60"
 
