@@ -574,7 +574,7 @@ def process():
             checklist_html, summary_html, tag, score = analyze_and_summarize(transcript)
 
             # 4) Хедер (для прев’ю) + тіло
-            header = f"BOTR: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
+            header = f"AI: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             body = (
                 f"<b>Новий дзвінок</b>\n"
                 f"<b>ПІБ:</b> {html_escape(name)}\n"
