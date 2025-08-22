@@ -2,12 +2,13 @@
 """
 Bitrix24 → Whisper → Telegram monitor (real-time, safe import)
 
-- Pulls latest calls from Bitrix24 (voximplant.statistic.get via total→start)
-- Downloads recording, transcribes with Whisper (OpenAI)
-- Enriches with CRM (name, phone, deeplink to activity/card)
-- Sends Telegram alert with PІБ + phone + CRM link + transcript preview
-- **Safe import**: no fail-fast at module import; env is validated inside process()
+- Тягне останні дзвінки з Bitrix24 (voximplant.statistic.get через total→start)
+- Скачує запис, транскрибує Whisper'ом (OpenAI)
+- Бере ПІБ/посилання з CRM
+- Шле у Telegram: короткий підсумок у першому рядку + детальна карточка з фрагментом
+- Без fail‑fast на імпорті: секрети перевіряються всередині process()
 """
+
 import os
 import json
 import pathlib
@@ -28,7 +29,7 @@ LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 LANGUAGE_HINT = os.getenv("LANGUAGE_HINT", "uk")
 TIMEOUT = 60
 
-# do not fail-fast here; runner's health must come up first
+# не валимо імпорт; лише нормалізуємо base
 if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith('/'):
     BITRIX_WEBHOOK_BASE += '/'
 
@@ -45,12 +46,10 @@ class CallItem:
     phone_number: t.Optional[str]
 
 # -------------------- Helpers --------------------
-
 def http_post_json(url: str, payload: dict) -> dict:
     resp = requests.post(url, json=payload, timeout=TIMEOUT)
     resp.raise_for_status()
     return resp.json()
-
 
 def http_get_binary(url: str) -> bytes:
     r = requests.get(url, timeout=TIMEOUT)
@@ -58,7 +57,6 @@ def http_get_binary(url: str) -> bytes:
     return r.content
 
 # -------------------- Bitrix24 --------------------
-
 def b24_vox_get_total() -> int:
     url = f"{BITRIX_WEBHOOK_BASE}voximplant.statistic.get.json"
     data = {"ORDER": {"CALL_START_DATE": "DESC"}, "LIMIT": 1}
@@ -72,7 +70,6 @@ def b24_vox_get_total() -> int:
     if total is None:
         raise RuntimeError(f"Can't find 'total' in response: {js}")
     return int(total)
-
 
 def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
     total = b24_vox_get_total()
@@ -110,20 +107,19 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
             )
         except Exception:
             continue
-    # Only calls with recording & duration>0
+
+    # Тільки дзвінки з записом і тривалістю > 0
     result = [r for r in result if r.duration and r.duration > 0 and r.record_url]
-    # Newest first
+    # Найновіші першими
     result = sorted(result, key=lambda x: x.call_start, reverse=True)[:limit]
     return result
 
 # -------------------- CRM helpers --------------------
-
 def _portal_base_from_webhook() -> str:
     try:
         return BITRIX_WEBHOOK_BASE.split('/rest/')[0].rstrip('/') + '/'
     except Exception:
         return BITRIX_WEBHOOK_BASE
-
 
 def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
     if not entity_type or not entity_id:
@@ -138,10 +134,14 @@ def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
         method = "crm.company.get.json"
     else:
         return "—"
-    js = http_post_json(f"{BITRIX_WEBHOOK_BASE}{method}", {"ID": str(entity_id)})
-    data = js.get("result", {})
-    if not data:
+    try:
+        js = http_post_json(f"{BITRIX_WEBHOOK_BASE}{method}", {"ID": str(entity_id)})
+    except requests.HTTPError as e:
+        # м’яко логнемо і повернемо дефолт
+        code = e.response.status_code if e.response is not None else "?"
+        print(f"[b24] name fetch failed {code}: {e}", flush=True)
         return "—"
+    data = js.get("result", {}) or {}
     parts = []
     for k in ("NAME", "SECOND_NAME", "LAST_NAME"):
         v = data.get(k)
@@ -151,7 +151,6 @@ def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
     if not name:
         name = str(data.get("TITLE", "")).strip() or "—"
     return name
-
 
 def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[str] = None) -> str:
     base = _portal_base_from_webhook()
@@ -168,26 +167,24 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
     return f"{base}{path}{entity_id}/" if path and entity_id else base
 
 # -------------------- Whisper --------------------
-
 def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     """
-    Force Ukrainian transcription (no auto-detect) and bias decoder with UA prompt.
+    Фіксуємо українську мову та даємо україномовний підказуючий prompt.
     """
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-    # короткий україномовний прайм, щоб декодер не «скочувався» в ru
     initial_prompt = (
         "Транскрибуй українською мовою (uk). Дотримуйся української орфографії, "
-        "без російських літер і кальок. Приклади: «будь ласка», «зв'язок», «підключення», «номер». "
-        "Не змішуй українську та російську."
+        "без російських літер і кальок. Приклади: «будь ласка», «зв'язок», "
+        "«підключення», «номер». Не змішуй українську та російську."
     )
 
-    # language/prompt мають йти у form-data (поле data), файл — у files
+    # language/prompt передаємо в 'data', файл — у 'files'
     files = {"file": (filename, audio_bytes, "audio/mpeg")}
     data = {
         "model": "whisper-1",
-        "language": (os.getenv("LANGUAGE_HINT") or "uk").strip().lower(),
+        "language": (LANGUAGE_HINT or "uk").strip().lower(),
         "temperature": 0,
         "prompt": initial_prompt,
     }
@@ -196,38 +193,46 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     r.raise_for_status()
     return r.json().get("text", "").strip()
 
-
 # -------------------- Telegram --------------------
-
 def tg_send_message(text: str) -> None:
     try:
+        if TG_BOT_TOKEN.startswith("sk-"):
+            print("[tg] ERROR: TG_BOT_TOKEN схожий на OpenAI ключ (sk-...). Замініть на токен BotFather.", flush=True)
+            return
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         r = requests.post(url, json=payload, timeout=TIMEOUT)
+        if r.status_code >= 400:
+            print(f"[tg] sendMessage {r.status_code}: {r.text[:300]}", flush=True)
         r.raise_for_status()
     except Exception:
         traceback.print_exc()
 
-# -------------------- Script Checking --------------------
-
+# -------------------- Simple checks --------------------
 def evaluate_transcript(transcript: str, rules: dict) -> str:
-    # Simplified: just return first 500 chars for now
-    return transcript[:500]
+    # Поки що: фрагмент 500 символів
+    return (transcript or "")[:500]
+
+def quick_compliance_hint(text: str) -> str:
+    """
+    Дуже проста евристика (заглушка): якщо є ввічливе привітання українською — «Так», інакше «Ні».
+    Далі замінимо на реальну перевірку сценарію.
+    """
+    t = (text or "").lower()
+    good = any(kw in t for kw in ("доброго дня", "добрий день", "вітаю"))
+    return "Так" if good else "Ні"
 
 # -------------------- State --------------------
-
 def load_state() -> dict:
     p = pathlib.Path(STATE_FILE)
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
     return {}
 
-
 def save_state(st: dict):
     pathlib.Path(STATE_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # -------------------- Env check --------------------
-
 def _require_env(name: str) -> bool:
     val = os.getenv(name, "")
     if not val:
@@ -236,9 +241,8 @@ def _require_env(name: str) -> bool:
     return True
 
 # -------------------- Main --------------------
-
 def process():
-    # Soft env validation (so runner's /health still works)
+    # М’яка валідація секретів (щоб /health жив навіть без них)
     if not all(_require_env(n) for n in ["BITRIX_WEBHOOK_BASE","OPENAI_API_KEY","TG_BOT_TOKEN","TG_CHAT_ID"]):
         return
 
@@ -248,6 +252,7 @@ def process():
     calls = b24_vox_get_latest(LIMIT_LAST)
     if not calls:
         return
+
     for c in calls:
         if c.call_id == last_seen:
             continue
@@ -257,20 +262,19 @@ def process():
             name = b24_get_entity_name(c.crm_entity_type, c.crm_entity_id)
             phone = c.phone_number or "—"
             preview = evaluate_transcript(transcript, {})
+            link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
-   link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
+            # Індикатор відповідності (проста евристика)
+            compliance = quick_compliance_hint(transcript)  # «Так»/«Ні»
 
-# Швидкий індикатор відповідності
-compliance = quick_compliance_hint(transcript)  # «Так»/«Ні»
+            # Перший рядок — короткий підсумок (видно в прев’ю списку чатів)
+            header = (
+                f"BOTR: 📞 {name} | {phone} | ⏱{c.duration}s | "
+                f"⚠️Відхилення: {'Так' if compliance == 'Ні' else 'Ні'}"
+            )
 
-# 1-й рядок — компактний підсумок (видно в прев’ю списку чатів)
-header = (
-    f"BOTR: 📞 {name} | {phone} | ⏱{c.duration}s | "
-    f"⚠️Відхилення: {'Так' if compliance == 'Ні' else 'Ні'}"
-)
-
-# Основне тіло
-body = f"""<b>Новий дзвінок</b>
+            # Детальна карточка
+            body = f"""<b>Новий дзвінок</b>
 <b>ПІБ:</b> {name}
 <b>Телефон:</b> {phone}
 <b>CRM:</b> <a href='{link}'>відкрити</a>
@@ -281,15 +285,18 @@ body = f"""<b>Новий дзвінок</b>
 <b>Аналіз (фрагмент 500):</b>
 <code>{preview}</code>"""
 
-msg = f"{header}\n\n{body}"
-tg_send_message(msg)
+            msg = f"{header}\n\n{body}"
+            tg_send_message(msg)
 
             state["last_seen_call_id"] = c.call_id
             save_state(state)
+
         except Exception:
             traceback.print_exc()
-            tg_send_message(f"🚨 Помилка обробки CALL_ID <code>{c.call_id}</code>:\n<code>{traceback.format_exc()[:3500]}</code>")
-
+            tg_send_message(
+                f"🚨 Помилка обробки CALL_ID <code>{c.call_id}</code>:\n"
+                f"<code>{traceback.format_exc()[:3500]}</code>"
+            )
 
 if __name__ == "__main__":
     process()
