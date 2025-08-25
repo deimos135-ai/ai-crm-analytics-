@@ -33,33 +33,29 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 
-# Мова для Whisper та підказка
+# Whisper/chat
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
-
-# Обмежуємо довжину транскрипту для економії токенів (0 = не різати)
+MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))          # ліміт файла, МБ
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "7000"))
 
 # -------------------- Фільтри витрат --------------------
-# Лише вхідні? (true/false)
 ONLY_INCOMING = (os.getenv("ONLY_INCOMING", "true").lower() == "true")
-# Мапа Bitrix: CALL_TYPE: 1 = incoming, 2 = outgoing (типово)
-INCOMING_CODE = os.getenv("INCOMING_CODE", "1")
-# Мінімальна тривалість у секундах (нижче — не транскрибувати)
+INCOMING_CODE = os.getenv("INCOMING_CODE", "1")              # Bitrix CALL_TYPE: 1=in, 2=out
 MIN_DURATION_SEC = int(os.getenv("MIN_DURATION_SEC", "10"))
 
 # -------------------- Weekly report settings --------------------
 WEEKLY_TZ = os.getenv("WEEKLY_TZ", "Europe/Kyiv")
-WEEKLY_REPORT_DAY = os.getenv("WEEKLY_REPORT_DAY", "Fri")   # Mon..Sun (strftime %a)
+WEEKLY_REPORT_DAY = os.getenv("WEEKLY_REPORT_DAY", "Fri")   # Mon..Sun
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "18"))
-WEEKLY_KEEP_DAYS = int(os.getenv("WEEKLY_KEEP_DAYS", "35")) # зберігати історію N днів
+WEEKLY_KEEP_DAYS = int(os.getenv("WEEKLY_KEEP_DAYS", "35"))
 
 CALLS_FILE = os.getenv("CALLS_FILE", "calls_week.jsonl")
 WEEKLY_STATE_FILE = os.getenv("WEEKLY_STATE_FILE", "weekly_state.json")
 CSV_FILENAME = os.getenv("WEEKLY_CSV_NAME", "weekly_calls.csv")
 
-# не валимо імпорт; лише нормалізуємо base
+# normalize base
 if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith('/'):
     BITRIX_WEBHOOK_BASE += '/'
 
@@ -74,7 +70,7 @@ class CallItem:
     crm_entity_id: t.Optional[str]
     crm_activity_id: t.Optional[str]
     phone_number: t.Optional[str]
-    call_type: t.Optional[str]   # 1=incoming, 2=outgoing (рядок)
+    call_type: t.Optional[str]   # 1=incoming, 2=outgoing
 
 # -------------------- Utils --------------------
 def html_escape(s: str) -> str:
@@ -84,11 +80,6 @@ def http_post_json(url: str, payload: dict) -> dict:
     resp = requests.post(url, json=payload, timeout=TIMEOUT)
     resp.raise_for_status()
     return resp.json()
-
-def http_get_binary(url: str) -> bytes:
-    r = requests.get(url, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.content
 
 def _require_env(name: str) -> bool:
     val = os.getenv(name, "")
@@ -150,13 +141,12 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
         except Exception:
             continue
 
-    # Тільки дзвінки з записом, тривалістю >= порога та (опційно) тільки вхідні
+    # Фільтруємо: запис, тривалість >= порога, (опційно) тільки вхідні
     result = [
         r for r in result
         if (r.duration and r.duration >= MIN_DURATION_SEC and r.record_url)
            and (not ONLY_INCOMING or (r.call_type == INCOMING_CODE))
     ]
-    # Найновіші першими
     result = sorted(result, key=lambda x: x.call_start, reverse=True)[:limit]
     return result
 
@@ -211,10 +201,77 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
     path = path_map.get(et)
     return f"{base}{path}{entity_id}/" if path and entity_id else base
 
+# -------------------- Audio fetch (robust) --------------------
+def fetch_audio(url: str, max_mb: int = 25) -> tuple[bytes, str, str]:
+    """
+    Завантажує запис з перевірками.
+    Повертає: (bytes, mime, suggest_filename)
+    Кидає виняток, якщо це не аудіо або великий файл.
+    """
+    headers = {"User-Agent": "ai-crm-analytics/1.0", "Accept": "*/*"}
+    with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=TIMEOUT) as r:
+        r.raise_for_status()
+        mime = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        clen = r.headers.get("Content-Length")
+        if clen is not None:
+            try:
+                size_bytes = int(clen)
+                if size_bytes > max_mb * 1024 * 1024:
+                    raise RuntimeError(f"Audio too large: {size_bytes} bytes > {max_mb}MB limit")
+            except Exception:
+                pass
+
+        data = b""
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                data += chunk
+                if len(data) > max_mb * 1024 * 1024:
+                    raise RuntimeError(f"Audio exceeded {max_mb}MB during download")
+
+    # Якщо повернулося не аудіо (частий кейс — HTML)
+    if not mime or mime in ("text/html", "application/xml", "text/plain"):
+        lower = url.lower()
+        if lower.endswith(".mp3"):
+            mime = "audio/mpeg"
+        elif lower.endswith(".wav"):
+            mime = "audio/wav"
+        elif lower.endswith(".m4a"):
+            mime = "audio/mp4"
+        else:
+            if len(data) < 1024:
+                raise RuntimeError(f"Unexpected content-type '{mime}' and tiny body ({len(data)} bytes)")
+            mime = "audio/mpeg"
+
+    if len(data) < 400:
+        raise RuntimeError(f"Downloaded audio too small: {len(data)} bytes")
+
+    filename = "audio"
+    if ".mp3" in url.lower():
+        filename += ".mp3"
+    elif ".wav" in url.lower():
+        filename += ".wav"
+    elif ".m4a" in url.lower():
+        filename += ".m4a"
+    else:
+        ext = {
+            "audio/mpeg": ".mp3",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a",
+            "audio/aac": ".aac",
+            "audio/ogg": ".ogg",
+            "audio/webm": ".webm",
+        }.get(mime, ".mp3")
+        filename += ext
+
+    return data, mime, filename
+
 # -------------------- OpenAI: Whisper --------------------
-def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
+def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3", mime: str = "audio/mpeg") -> str:
     """
     Фіксуємо українську мову та даємо україномовний підказуючий prompt.
+    Передаємо правильний MIME.
     """
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -225,7 +282,7 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
         "«підключення», «номер». Не змішуй українську та російську."
     )
 
-    files = {"file": (filename, audio_bytes, "audio/mpeg")}
+    files = {"file": (filename, audio_bytes, mime)}
     data = {
         "model": "whisper-1",
         "language": LANGUAGE_HINT,
@@ -234,19 +291,22 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3") -> str:
     }
 
     r = requests.post(url, headers=headers, files=files, data=data, timeout=TIMEOUT)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+        except Exception:
+            err = r.text
+        raise requests.HTTPError(f"OpenAI audio/transcriptions {r.status_code}: {err}")
     return r.json().get("text", "").strip()
 
 # -------------------- OpenAI: One-shot analysis + summary --------------------
 def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
     """
     Один запит до OpenAI: повертає (html_checklist, html_summary, tag, score_0_8).
-    Модель відповідає у JSON, ми парсимо та екрануємо в HTML.
     """
     if not transcript:
         return ("Немає транскрипту для аналізу.", "Немає даних для резюме.", "Інше", 0)
 
-    # (опційно) скорочуємо надто великі транскрипти для економії токенів
     if MAX_TRANSCRIPT_CHARS > 0 and len(transcript) > MAX_TRANSCRIPT_CHARS:
         transcript = transcript[:MAX_TRANSCRIPT_CHARS] + " …(урізано для економії токенів)"
 
@@ -257,14 +317,12 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
 
     system = (
         "Ти — аналітик якості кол-центру. Пиши українською. "
-        "Поверни СТРОГИЙ JSON рівня кореня з трьома полями: "
-        '{"checklist":[...8 пунктів], "summary":"1-2 речення", "tag":"ОДИН з дозволених тегів"}. '
-        f'Дозволені теги: {", ".join(allowed_tags)}. '
-        "Жодного іншого тексту поза JSON."
+        "Поверни СТРОГИЙ JSON рівня кореня з полями: "
+        '{"checklist":[...8], "summary":"...", "tag":"..."} '
+        f'Дозволені теги: {", ".join(allowed_tags)}. Жодного тексту поза JSON.'
     )
     user = f"""
-Оціни розмову за 8 критеріями (у цій послідовності) і дай стислий підсумок.
-Також вибери ОДИН tag із списку дозволених.
+Оціни розмову за 8 критеріями і дай стисле резюме. Обери один тег із списку.
 
 Критерії:
 1. Привітання по скрипту (представився).
@@ -278,16 +336,7 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
 
 Формат JSON (строго):
 {{
-  "checklist": [
-    "✅ Привітання по скрипту: ...",
-    "⚠️ З’ясування суті звернення: ...",
-    "✅ Ввічливість і емпатія: ...",
-    "✅ Не перебивав: ...",
-    "❌ Рішення: ...",
-    "⚠️ Наступні дії або строки: ...",
-    "❌ Допомога/upsell: ...",
-    "✅ Завершення: ..."
-  ],
+  "checklist": ["...", "...", "...", "...", "...", "...", "...", "..."],
   "summary": "1-2 речення без оцінок, лише суть розмови.",
   "tag": "Один зі списку: {', '.join(allowed_tags)}"
 }}
@@ -297,11 +346,10 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
 {transcript}
 ---
 """
-
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": OPENAI_CHAT_MODEL,  # напр. gpt-4o-mini
+        "model": OPENAI_CHAT_MODEL,
         "messages": [{"role":"system","content":system},{"role":"user","content":user}],
         "max_tokens": 750,
         "temperature": 0.2,
@@ -319,7 +367,6 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
 
         if isinstance(checklist_items, list):
             checklist_html = "\n".join(html_escape(line) for line in checklist_items)
-            # рахуємо бали за кількістю ✅ на початку пунктів
             score = sum(1 for line in checklist_items if isinstance(line, str) and line.strip().startswith("✅"))
         else:
             checklist_html = html_escape(str(checklist_items))
@@ -331,7 +378,6 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
             str(tag),
             int(score),
         )
-
     except Exception:
         content = r.json()["choices"][0]["message"]["content"]
         safe = html_escape(content.strip())
@@ -339,24 +385,15 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
 
 # -------------------- Telegram --------------------
 def tg_send_message(text: str) -> None:
-    """
-    Відправляє повідомлення. Якщо довше за ~3500 символів — ріже на частини.
-    """
     try:
         if TG_BOT_TOKEN.startswith("sk-"):
             print("[tg] ERROR: TG_BOT_TOKEN схожий на OpenAI ключ (sk-...). Замініть на токен BotFather.", flush=True)
             return
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-
         CHUNK = 3500
         parts = [text[i:i+CHUNK] for i in range(0, len(text), CHUNK)] or [text]
         for part in parts:
-            payload = {
-                "chat_id": TG_CHAT_ID,
-                "text": part,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
+            payload = {"chat_id": TG_CHAT_ID, "text": part, "parse_mode": "HTML", "disable_web_page_preview": True}
             r = requests.post(url, json=payload, timeout=TIMEOUT)
             if r.status_code >= 400:
                 print(f"[tg] sendMessage {r.status_code}: {r.text[:300]}", flush=True)
@@ -384,7 +421,7 @@ def _now_kyiv() -> datetime:
     return datetime.now(ZoneInfo(WEEKLY_TZ))
 
 def _iso_week_key(dt: datetime) -> str:
-    iso = dt.isocalendar()  # (year, week, weekday)
+    iso = dt.isocalendar()
     return f"{iso[0]}-W{iso[1]:02d}"
 
 def _weekday_name(dt: datetime) -> str:
@@ -437,7 +474,6 @@ def _prune_old_calls():
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
 def _week_bounds_kyiv(now: datetime) -> tuple[datetime, datetime]:
-    # останні 7 днів від "зараз" у Kyiv TZ -> у UTC для фільтра
     end_kyiv = now
     start_kyiv = now - timedelta(days=7)
     return start_kyiv.astimezone(ZoneInfo("UTC")), end_kyiv.astimezone(ZoneInfo("UTC"))
@@ -447,7 +483,6 @@ def _send_weekly_report():
     start_utc, end_utc = _week_bounds_kyiv(now)
     calls = _read_calls()
 
-    # фільтруємо останні 7 днів
     window = []
     for it in calls:
         try:
@@ -462,16 +497,13 @@ def _send_weekly_report():
         tg_send_message("📊 Тижневий звіт: за період дзвінків не знайдено.")
         return
 
-    # агрегати
     avg_dur = round(sum(it.get("duration",0) or 0 for it in window)/total, 1)
     avg_score = round(sum(it.get("score",0) or 0 for it in window)/total, 2)
 
-    # розподіл тегів
     tag_counts = Counter((it.get("tag") or "Інше") for it in window)
     top_tags = tag_counts.most_common(5)
     tags_block = "\n".join([f"• {html_escape(t)} — {n}" for t, n in top_tags]) or "• —"
 
-    # топ-3 «проблемні» (найнижчий бал)
     worst = sorted(window, key=lambda x: (x.get("score",0), x.get("duration",0)))[:3]
     worst_block = "\n".join([
         f"• {html_escape(it.get('name','—'))} | {html_escape(it.get('phone','—'))} | "
@@ -479,7 +511,6 @@ def _send_weekly_report():
         for it in worst
     ]) or "• —"
 
-    # зліпимо повідомлення
     title = f"📊 Тижневий звіт ({now.strftime('%d.%m.%Y')})"
     body = (
         f"<b>{title}</b>\n"
@@ -491,7 +522,6 @@ def _send_weekly_report():
     )
     tg_send_message(body)
 
-    # CSV додаємо як документ
     try:
         csv_path = pathlib.Path(CSV_FILENAME)
         with csv_path.open("w", encoding="utf-8", newline="") as f:
@@ -513,21 +543,13 @@ def _send_weekly_report():
         traceback.print_exc()
 
 def _maybe_send_weekly_report():
-    """
-    Викликається кожен tick у process(): якщо зараз WEEKLY_REPORT_DAY @ WEEKLY_REPORT_HOUR і
-    за тиждень ще не відсилали — відсилаємо та помічаємо в state.
-    """
     st = _load_weekly_state()
     now = _now_kyiv()
     week_key = _iso_week_key(now)
-
-    # день/година за розкладом?
-    if _weekday_name(now) != WEEKLY_REPORT_DAY or now.hour != WEEKLY_REPORT_HOUR:
+    if now.strftime("%a") != WEEKLY_REPORT_DAY or now.hour != WEEKLY_REPORT_HOUR:
         return
-
     if st.get("last_sent_week") == week_key:
         return
-
     _send_weekly_report()
     st["last_sent_week"] = week_key
     _save_weekly_state(st)
@@ -545,7 +567,6 @@ def save_state(st: dict):
 
 # -------------------- Main --------------------
 def process():
-    # М’яка валідація секретів (щоб /health жив навіть без них)
     if not all(_require_env(n) for n in ["BITRIX_WEBHOOK_BASE","OPENAI_API_KEY","TG_BOT_TOKEN","TG_CHAT_ID"]):
         return
 
@@ -561,20 +582,22 @@ def process():
         if c.call_id == last_seen:
             continue
         try:
-            # 1) Аудіо → транскрипція
-            audio = http_get_binary(c.record_url)
-            transcript = transcribe_whisper(audio, filename=f"{c.call_id}.mp3")
+            # 1) Надійно тягнемо аудіо
+            audio, mime, fname = fetch_audio(c.record_url, max_mb=MAX_AUDIO_MB)
 
-            # 2) Ім'я/посилання/номер
+            # 2) Транскрибуємо
+            transcript = transcribe_whisper(audio, filename=fname, mime=mime)
+
+            # 3) CRM дані
             name = b24_get_entity_name(c.crm_entity_type, c.crm_entity_id)
             phone = c.phone_number or "—"
             link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
-            # 3) Аналітика (чек‑лист + резюме + tag + score) одним запитом
+            # 4) Аналітика (один запит)
             checklist_html, summary_html, tag, score = analyze_and_summarize(transcript)
 
-            # 4) Хедер (для прев’ю) + тіло
-            header = f"AI: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
+            # 5) Повідомлення
+            header = f"BOTR: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             body = (
                 f"<b>Новий дзвінок</b>\n"
                 f"<b>ПІБ:</b> {html_escape(name)}\n"
@@ -589,11 +612,11 @@ def process():
             )
             tg_send_message(f"{header}\n\n{body}")
 
-            # 5) Маркуємо як оброблений
+            # 6) Маркер
             state["last_seen_call_id"] = c.call_id
             save_state(state)
 
-            # 6) Логуємо короткий запис для тижневого звіту
+            # 7) Лог для тижневого звіту
             _append_call_record({
                 "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "call_id": c.call_id,
@@ -605,14 +628,16 @@ def process():
                 "summary": summary_html,
             })
 
-        except Exception:
+        except Exception as e:
             traceback.print_exc()
             tg_send_message(
-                f"🚨 Помилка обробки CALL_ID <code>{html_escape(c.call_id)}</code>:\n"
-                f"<code>{html_escape(traceback.format_exc()[:3500])}</code>"
+                "🚨 Помилка обробки CALL_ID "
+                f"<code>{html_escape(c.call_id)}</code>:\n"
+                f"<code>{html_escape(str(e))[:1200]}</code>\n"
+                "Підказка: 400 від OpenAI зазвичай означає не-аудіо/HTML або занадто великий файл, "
+                "або протухлий запис із Bitrix/Vox."
             )
 
-    # 7) Можливо, час тижневого звіту
     _maybe_send_weekly_report()
 
 if __name__ == "__main__":
