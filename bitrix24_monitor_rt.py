@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 """
 Bitrix24 → Whisper → Telegram monitor (real-time, weekly analytics, safe import)
@@ -6,6 +7,7 @@ Bitrix24 → Whisper → Telegram monitor (real-time, weekly analytics, safe imp
 - Фільтрує тільки вхідні (або за env) + мінімальна тривалість
 - Скачує запис, перевіряє MIME/розмір, транскрибує Whisper'ом (uk + підказка)
 - ОДИН запит до OpenAI (chat): FACTS → EVAL (8 критеріїв) + summary + tag + coaching + risks
+- Додає "Trust" (довіра) як метрику: transcript_trust, analysis_trust, overall_trust
 - Шле у Telegram: короткий підсумок + структурований аналіз (+ evidence опційно)
 - Пише кожен дзвінок у JSONL (calls_week.jsonl)
 - Раз на тиждень (Fri 18:00 Europe/Kyiv) шле тижневий звіт + CSV
@@ -37,7 +39,7 @@ LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
 
-# Якщо ціна не проблема — ставимо сильну модель (можна оверрайднути env’ом)
+# Якщо ціна не проблема — сильна модель (можна оверрайднути env’ом)
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
@@ -109,12 +111,85 @@ def _require_env(name: str) -> bool:
 
 def _strip_html(s: str) -> str:
     s = (s or "")
-    s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    return s
+    return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
 
 
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+# -------------------- Trust metrics --------------------
+def compute_transcript_trust(transcript: str, duration_sec: t.Optional[int]) -> int:
+    """
+    0..100, евристика якості транскрипту (без word-level confidence).
+    Основна ідея: якщо текст підозріло короткий для тривалості -> низька довіра.
+    """
+    if not transcript:
+        return 0
+
+    words = len(re.findall(r"[A-Za-zА-Яа-яІіЇїЄє0-9']+", transcript))
+    if not duration_sec or duration_sec <= 0:
+        # Якщо немає тривалості — грубо по довжині
+        # 1200+ символів ~ пристойно
+        return int(round(_clamp((len(transcript) / 1200) * 100, 20, 95)))
+
+    minutes = duration_sec / 60.0
+    expected = max(30, int(minutes * 120))  # 120 wpm baseline
+    ratio = _clamp(words / expected, 0.0, 1.2)
+
+    # ratio 0.9+ -> ~100, ratio 0.45 -> ~50
+    trust = 100 * _clamp(ratio / 0.9, 0.0, 1.0)
+    return int(round(trust))
+
+
+def compute_analysis_trust(analysis_obj: dict) -> int:
+    """
+    0..100: довіра до висновків на основі checklist (status+confidence).
+    """
+    cl = analysis_obj.get("checklist") or []
+    if not isinstance(cl, list) or not cl:
+        return 0
+
+    def w(status: str) -> float:
+        return {"ok": 1.0, "partial": 0.6, "fail": 0.3}.get(status, 0.5)
+
+    contrib = []
+    for it in cl:
+        if not isinstance(it, dict):
+            continue
+        status = str(it.get("status") or "")
+        conf = it.get("confidence")
+        if not isinstance(conf, (int, float)):
+            conf = 0.0
+        contrib.append(w(status) * float(conf))
+
+    if not contrib:
+        return 0
+
+    avg = sum(contrib) / len(contrib)
+    return int(round(100 * _clamp(avg, 0.0, 1.0)))
+
+
+def compute_overall_trust(transcript_trust: int, analysis_trust: int) -> int:
+    """
+    Загальна довіра — “чесна”: обмежуємося найслабшою ланкою.
+    """
+    return min(int(transcript_trust), int(analysis_trust))
+
+
+def trust_badge(overall: int) -> tuple[str, str]:
+    """
+    (emoji, label)
+    """
+    if overall >= 85:
+        return "✅", "висока"
+    if overall >= 60:
+        return "⚠️", "середня"
+    return "❌", "низька"
 
 
 # -------------------- Bitrix24 --------------------
@@ -173,7 +248,6 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
         except Exception:
             continue
 
-    # Тільки дзвінки з записом, тривалістю >= порога та (опційно) тільки вхідні
     result = [
         r
         for r in result
@@ -336,9 +410,6 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3", mime: st
 
 # -------------------- Analysis helpers --------------------
 def _segment_transcript(text: str) -> dict:
-    """
-    intro ~ перші 1200, outro ~ останні 1200, middle ~ середина.
-    """
     ttxt = (text or "").strip()
     if not ttxt:
         return {"intro": "", "middle": "", "outro": ""}
@@ -435,7 +506,7 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
 8) {labels[7]}
 
 Важливо:
-- note: це КОНКРЕТНЕ пояснення (НЕ повторюй назву критерію).
+- note: КОНКРЕТНЕ пояснення (НЕ повторюй назву критерію).
 - evidence: коротка цитата, що підтверджує висновок (або "" якщо немає/нечутно).
 - confidence: 0..1. Якщо confidence < 0.6, статус НЕ може бути "ok".
 - facts: об’єктивні факти без оцінок (представився/уточнював/дав рішення/дав строки/завершив тощо).
@@ -470,7 +541,7 @@ OUTRO:
         payload = {
             "model": OPENAI_CHAT_MODEL,
             "messages": messages,
-            "temperature": 0.12,  # трошки нижче для дисципліни
+            "temperature": 0.12,
             "max_tokens": 1200,
             "response_format": {"type": "json_object"},
         }
@@ -510,7 +581,7 @@ OUTRO:
             if len(note_s) < 6 or len(note_s) > 220:
                 return False, f"checklist[{i}].note bad length"
 
-            # ✅ ключова правка: note не може дорівнювати назві критерію
+            # note не може дорівнювати назві критерію
             if _norm_ws(note_s) == _norm_ws(labels[i]):
                 return False, f"checklist[{i}].note equals label"
 
@@ -524,9 +595,12 @@ OUTRO:
             if conf < 0 or conf > 1:
                 return False, f"checklist[{i}].confidence out of range"
 
-            # anti-hallucination: low confidence => not ok
             if float(conf) < 0.6 and st == "ok":
                 return False, f"checklist[{i}] ok with low confidence"
+
+            # Додатково: сумнівне ok теж не ок
+            if float(conf) < 0.75 and st == "ok":
+                return False, f"checklist[{i}] ok with conf<0.75"
 
             if note_s.lower() in ("так", "ні", "ок", "добре"):
                 return False, f"checklist[{i}] trivial note"
@@ -555,8 +629,8 @@ OUTRO:
         if not isinstance(risk_flags, list) or not all(isinstance(x, str) for x in risk_flags):
             return False, "risk_flags invalid"
 
-        # Додаткова страховка: top_issues не мають бути тупо темою дзвінка (дуже грубий фільтр)
-        bad_topic_tokens = ("немає інтернет", "закінчил", "кошти", "рахунок", "тариф", "оплат", "поповнен", "інтернету немає")
+        # Страховка: top_issues не має бути темою дзвінка
+        bad_topic_tokens = ("немає інтернет", "закінчил", "кошти", "рахунок", "тариф", "оплат", "поповнен")
         ti_join = " ".join([_norm_ws(x) for x in top_issues if isinstance(x, str)])
         if any(tok in ti_join for tok in bad_topic_tokens) and "немає суттєвих зауважень" not in ti_join:
             return False, "coaching.top_issues looks like call topic"
@@ -568,7 +642,6 @@ OUTRO:
     ok, _ = _validate(obj)
 
     if not ok:
-        # 2-й виклик — посилення дисципліни
         obj = _call_openai(
             _build_messages(
                 fix_note=(
@@ -609,7 +682,12 @@ OUTRO:
         if st == "ok":
             score += 1
 
-        lines.append(f"{emoji} {labels[i]}: {note} (conf {conf:.2f})")
+        # conf показуємо тільки якщо: не ok або сумнівно (<0.8)
+        conf_str = ""
+        if st != "ok" or conf < 0.8:
+            conf_str = f" (conf {conf:.2f})"
+
+        lines.append(f"{emoji} {labels[i]}: {note}{conf_str}")
 
         if SHOW_EVIDENCE_IN_TG and ev:
             lines.append(f"    <i>«{html_escape(ev)}»</i>")
@@ -804,10 +882,12 @@ def _send_weekly_report():
     try:
         csv_path = pathlib.Path(CSV_FILENAME)
         with csv_path.open("w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["ts", "call_id", "name", "phone", "duration", "tag", "score", "summary"])
+            w = csv.DictWriter(f, fieldnames=["ts", "call_id", "name", "phone", "duration", "tag", "score", "summary", "trust"])
             w.writeheader()
             for it in window:
                 summary_plain = (it.get("summary_plain") or it.get("summary") or "")
+                trust = it.get("trust", {})
+                overall = trust.get("overall", "")
                 w.writerow(
                     {
                         "ts": it.get("ts", ""),
@@ -818,6 +898,7 @@ def _send_weekly_report():
                         "tag": it.get("tag", ""),
                         "score": it.get("score", ""),
                         "summary": summary_plain,
+                        "trust": overall,
                     }
                 )
         _tg_send_document(str(csv_path), caption=title)
@@ -861,7 +942,6 @@ def process():
         return
 
     state = load_state()
-
     processed_list = state.get("processed_call_ids") or []
     processed_set = set(processed_list)
 
@@ -886,6 +966,17 @@ def process():
                 transcript, call_duration_sec=c.duration
             )
 
+            # Trust
+            transcript_trust = compute_transcript_trust(transcript, c.duration)
+            analysis_trust = compute_analysis_trust(analysis_obj if isinstance(analysis_obj, dict) else {})
+            overall_trust = compute_overall_trust(transcript_trust, analysis_trust)
+            trust_emoji, trust_label = trust_badge(overall_trust)
+
+            trust_line = (
+                f"<b>Trust:</b> {trust_emoji} <b>{overall_trust}%</b> ({trust_label}) "
+                f"| transcript {transcript_trust}% | analysis {analysis_trust}%"
+            )
+
             header = f"AI: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             body = (
                 f"<b>Новий дзвінок</b>\n"
@@ -895,7 +986,8 @@ def process():
                 f"<b>CALL_ID:</b> <code>{html_escape(c.call_id)}</code>\n"
                 f"<b>Початок:</b> {html_escape(c.call_start)}\n"
                 f"<b>Тривалість:</b> {c.duration}s\n"
-                f"<b>Тема:</b> {html_escape(tag)} | <b>Бал:</b> {score}/8\n\n"
+                f"<b>Тема:</b> {html_escape(tag)} | <b>Бал:</b> {score}/8\n"
+                f"{trust_line}\n\n"
                 f"<b>Аналіз розмови:</b>\n{checklist_html}\n\n"
                 f"<b>Коротке резюме:</b> {summary_html}"
             )
@@ -925,6 +1017,11 @@ def process():
                     "summary": summary_html,
                     "summary_plain": summary_plain,
                     "analysis": analysis_obj,
+                    "trust": {
+                        "overall": overall_trust,
+                        "transcript": transcript_trust,
+                        "analysis": analysis_trust,
+                    },
                 }
             )
 
@@ -943,3 +1040,4 @@ def process():
 
 if __name__ == "__main__":
     process()
+```
