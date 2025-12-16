@@ -1,5 +1,4 @@
 app = "ai-analytics-"
-primary_region = "waw"
 
 [build]
   dockerfile = "Dockerfile"
