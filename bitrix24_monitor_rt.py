@@ -753,7 +753,6 @@ def process():
                 f"<b>ПІБ:</b> {html_escape(name)}\n"
                 f"<b>Телефон:</b> {html_escape(phone)}\n"
                 f"<b>CRM:</b> <a href='{html_escape(link)}'>відкрити</a>\n"
-                f"<b>CALL_ID:</b> <code>{html_escape(c.call_id)}</code>\n"
                 f"<b>Початок:</b> {html_escape(c.call_start)}\n"
                 f"<b>Тривалість:</b> {c.duration}s\n"
                 f"<b>Тема:</b> {html_escape(tag)} | <b>Бал:</b> {score}/8\n\n"
