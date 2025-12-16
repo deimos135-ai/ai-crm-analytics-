@@ -351,7 +351,7 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
         "Не перебивав",
         "Рішення",
         "Наступні дії або строки",
-        "Допомога/upsell",
+        "Допомога",
         "Завершення",
     ]
 
