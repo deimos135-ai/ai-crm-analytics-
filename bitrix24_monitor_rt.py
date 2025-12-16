@@ -6,7 +6,7 @@ Bitrix24 → Whisper → Telegram monitor (real-time, weekly analytics, safe imp
 - Фільтрує тільки вхідні (або за env) + мінімальна тривалість
 - Скачує запис, перевіряє MIME/розмір, транскрибує Whisper'ом (uk + підказка)
 - ОДИН запит до OpenAI (chat): FACTS → EVAL (8 критеріїв) + summary + tag + coaching + risks
-- Шле у Telegram: короткий підсумок + структурований аналіз + (evidence за бажанням)
+- Шле у Telegram: короткий підсумок + структурований аналіз (+ evidence опційно)
 - Пише кожен дзвінок у JSONL (calls_week.jsonl)
 - Раз на тиждень (Fri 18:00 Europe/Kyiv) шле тижневий звіт + CSV
 - Без fail-fast на імпорті: секрети перевіряються всередині process()
@@ -37,7 +37,7 @@ LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
 
-# якщо ціна не проблема — за замовчуванням беремо сильну модель
+# Якщо ціна не проблема — ставимо сильну модель (можна оверрайднути env’ом)
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
@@ -58,10 +58,10 @@ CALLS_FILE = os.getenv("CALLS_FILE", "calls_week.jsonl")
 WEEKLY_STATE_FILE = os.getenv("WEEKLY_STATE_FILE", "weekly_state.json")
 CSV_FILENAME = os.getenv("WEEKLY_CSV_NAME", "weekly_calls.csv")
 
-# керування тим, чи показувати цитати у Telegram
+# Чи показувати evidence (цитати) в TG
 SHOW_EVIDENCE_IN_TG = (os.getenv("SHOW_EVIDENCE_IN_TG", "false").lower() == "true")
 
-# скільки processed_call_ids тримати в state (антидубль)
+# Скільки processed_call_ids тримати у state
 PROCESSED_KEEP = int(os.getenv("PROCESSED_KEEP", "800"))
 
 if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith("/"):
@@ -79,7 +79,7 @@ class CallItem:
     crm_entity_id: t.Optional[str]
     crm_activity_id: t.Optional[str]
     phone_number: t.Optional[str]
-    call_type: t.Optional[str]  # 1=incoming, 2=outgoing (рядок)
+    call_type: t.Optional[str]
 
 
 # -------------------- Utils --------------------
@@ -89,7 +89,7 @@ def html_escape(s: str) -> str:
 
 def http_post_json(url: str, payload: dict) -> dict:
     """
-    Важливо: при помилках Bitrix часто повертає корисний body.
+    Bitrix при помилках часто повертає корисний body.
     Логуємо його, щоб не гадати “чому 401/403/500”.
     """
     resp = requests.post(url, json=payload, timeout=TIMEOUT)
@@ -108,10 +108,13 @@ def _require_env(name: str) -> bool:
 
 
 def _strip_html(s: str) -> str:
-    # дуже простий “strip” для наших summary (де HTML мінімальний)
     s = (s or "")
     s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     return s
+
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
 # -------------------- Bitrix24 --------------------
@@ -170,6 +173,7 @@ def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
         except Exception:
             continue
 
+    # Тільки дзвінки з записом, тривалістю >= порога та (опційно) тільки вхідні
     result = [
         r
         for r in result
@@ -234,7 +238,7 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
     return f"{base}{path}{entity_id}/" if path and entity_id else base
 
 
-# -------------------- Audio fetch (safe + memory friendly) --------------------
+# -------------------- Audio fetch --------------------
 def fetch_audio(url: str, max_mb: int = 25) -> tuple[bytes, str, str]:
     headers = {"User-Agent": "ai-crm-analytics/1.0", "Accept": "*/*"}
     max_bytes = max_mb * 1024 * 1024
@@ -333,37 +337,34 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3", mime: st
 # -------------------- Analysis helpers --------------------
 def _segment_transcript(text: str) -> dict:
     """
-    Просте сегментування без таймкодів:
-    intro ~ перші 1200 символів, outro ~ останні 1200, middle ~ середина.
+    intro ~ перші 1200, outro ~ останні 1200, middle ~ середина.
     """
-    t = (text or "").strip()
-    if not t:
+    ttxt = (text or "").strip()
+    if not ttxt:
         return {"intro": "", "middle": "", "outro": ""}
 
-    n = len(t)
+    n = len(ttxt)
     intro_len = min(1200, n)
     outro_len = min(1200, max(0, n - intro_len))
 
-    intro = t[:intro_len].strip()
-    outro = t[-outro_len:].strip() if outro_len > 0 else t[-min(600, n):].strip()
+    intro = ttxt[:intro_len].strip()
+    outro = ttxt[-outro_len:].strip() if outro_len > 0 else ttxt[-min(600, n):].strip()
 
     if n <= intro_len + outro_len + 50:
-        middle = t[intro_len:].strip()
+        middle = ttxt[intro_len:].strip()
     else:
         mid_start = max(intro_len, (n // 2) - 1200)
         mid_end = min(n - outro_len, (n // 2) + 1200)
-        middle = t[mid_start:mid_end].strip()
+        middle = ttxt[mid_start:mid_end].strip()
 
     return {"intro": intro, "middle": middle, "outro": outro}
 
 
-# -------------------- OpenAI: Ultimate analysis (facts+evidence+confidence+coaching) --------------------
+# -------------------- OpenAI: Ultimate analysis --------------------
 def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = None) -> tuple[str, str, str, int, dict]:
     """
     Повертає:
       (html_checklist, html_summary, tag, score_0_8, analysis_obj)
-
-    analysis_obj кладемо в JSONL для майбутнього дашборду/QA.
     """
     if not transcript:
         return ("Немає транскрипту для аналізу.", "Немає даних для резюме.", "Інше", 0, {"error": "empty_transcript"})
@@ -399,7 +400,8 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
 
     def _build_messages(fix_note: str = ""):
         system = (
-            "Ти — провідний QA-аналітик кол-центру. Відповідай ТІЛЬКИ УКРАЇНСЬКОЮ. "
+            "Ти — провідний QA-аналітик кол-центру (оцінка якості роботи оператора). "
+            "Відповідай ТІЛЬКИ УКРАЇНСЬКОЮ. "
             "ПОВЕРТАЙ СУВОРО JSON (без будь-якого тексту поза JSON). "
             "ЗАБОРОНЕНО вигадувати факти: якщо ознаки немає в тексті — так і скажи, evidence може бути порожнім. "
             "Якщо не впевнений — став partial або fail, а не ok. "
@@ -421,7 +423,7 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
         )
 
         user = f"""
-Зроби аналіз вхідного дзвінка за 8 критеріями у заданому форматі.
+Зроби аналіз ВХІДНОГО дзвінка за 8 критеріями у заданому форматі.
 Критерії (порядок незмінний):
 1) {labels[0]}
 2) {labels[1]}
@@ -429,15 +431,19 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
 4) {labels[3]}
 5) {labels[4]}
 6) {labels[5]}
-7) {labels[6]}
+7) {labels[6]}  (чи оператор уточнив, чи всі питання вирішені, і запропонував допомогу "Чи можу ще чимось допомогти?")
 8) {labels[7]}
 
 Важливо:
-- evidence: коротка цитата з транскрипту, яка підтверджує висновок (або "" якщо цитати нема/нечутно).
+- note: це КОНКРЕТНЕ пояснення (НЕ повторюй назву критерію).
+- evidence: коротка цитата, що підтверджує висновок (або "" якщо немає/нечутно).
 - confidence: 0..1. Якщо confidence < 0.6, статус НЕ може бути "ok".
-- facts: максимально об’єктивні факти без оцінок (наприклад: чи представився оператор, чи озвучив строки, чи був upsell).
-- coaching: 2 головні проблеми + 1 порада (1 речення).
-- risk_flags: короткі маркери ризиків, напр. ["клієнт незадоволений","потрібна ескалація","незрозумілий запит"] або [].
+- facts: об’єктивні факти без оцінок (представився/уточнював/дав рішення/дав строки/завершив тощо).
+- coaching.top_issues: це 2 недоліки саме роботи оператора (скрипт/комунікація/наступні кроки/допомога/завершення).
+  НЕ пиши сюди тему дзвінка чи проблему клієнта (типу "немає інтернету", "закінчились кошти").
+  Якщо суттєвих недоліків немає: ["Немає суттєвих зауважень","—"].
+- coaching.one_sentence_tip: 1 речення, що реально допоможе оператору.
+- risk_flags: короткі маркери ризиків (незадоволення/ескалація/незрозуміло/не вирішено), або [].
 
 Контекст:
 - Тривалість дзвінка (сек): {call_duration_sec if call_duration_sec is not None else "невідомо"}
@@ -464,8 +470,8 @@ OUTRO:
         payload = {
             "model": OPENAI_CHAT_MODEL,
             "messages": messages,
-            "temperature": 0.15,
-            "max_tokens": 1100,
+            "temperature": 0.12,  # трошки нижче для дисципліни
+            "max_tokens": 1200,
             "response_format": {"type": "json_object"},
         }
         r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
@@ -504,6 +510,10 @@ OUTRO:
             if len(note_s) < 6 or len(note_s) > 220:
                 return False, f"checklist[{i}].note bad length"
 
+            # ✅ ключова правка: note не може дорівнювати назві критерію
+            if _norm_ws(note_s) == _norm_ws(labels[i]):
+                return False, f"checklist[{i}].note equals label"
+
             if not isinstance(ev, str):
                 return False, f"checklist[{i}].evidence not string"
             if len(ev) > 180:
@@ -514,8 +524,8 @@ OUTRO:
             if conf < 0 or conf > 1:
                 return False, f"checklist[{i}].confidence out of range"
 
-            # анти-галюцинація: якщо low confidence — не ok
-            if conf < 0.6 and st == "ok":
+            # anti-hallucination: low confidence => not ok
+            if float(conf) < 0.6 and st == "ok":
                 return False, f"checklist[{i}] ok with low confidence"
 
             if note_s.lower() in ("так", "ні", "ок", "добре"):
@@ -532,9 +542,11 @@ OUTRO:
         coaching = obj.get("coaching")
         if not isinstance(coaching, dict):
             return False, "coaching missing"
+
         top_issues = coaching.get("top_issues")
         tip = coaching.get("one_sentence_tip")
-        if not isinstance(top_issues, list) or len(top_issues) != 2 or not all(isinstance(x, str) and x.strip() for x in top_issues):
+
+        if not isinstance(top_issues, list) or len(top_issues) != 2 or not all(isinstance(x, str) for x in top_issues):
             return False, "coaching.top_issues invalid"
         if not isinstance(tip, str) or len(tip.strip()) < 10:
             return False, "coaching.one_sentence_tip invalid"
@@ -542,6 +554,12 @@ OUTRO:
         risk_flags = obj.get("risk_flags")
         if not isinstance(risk_flags, list) or not all(isinstance(x, str) for x in risk_flags):
             return False, "risk_flags invalid"
+
+        # Додаткова страховка: top_issues не мають бути тупо темою дзвінка (дуже грубий фільтр)
+        bad_topic_tokens = ("немає інтернет", "закінчил", "кошти", "рахунок", "тариф", "оплат", "поповнен", "інтернету немає")
+        ti_join = " ".join([_norm_ws(x) for x in top_issues if isinstance(x, str)])
+        if any(tok in ti_join for tok in bad_topic_tokens) and "немає суттєвих зауважень" not in ti_join:
+            return False, "coaching.top_issues looks like call topic"
 
         return True, ""
 
@@ -551,26 +569,34 @@ OUTRO:
 
     if not ok:
         # 2-й виклик — посилення дисципліни
-        obj = _call_openai(_build_messages(
-            fix_note="Попередня відповідь порушила формат. Суворо дотримуйся схеми. "
-                     "8 елементів checklist, confidence 0..1, low confidence => не ok, evidence <=180, жодних зайвих ключів."
-        ))
+        obj = _call_openai(
+            _build_messages(
+                fix_note=(
+                    "Попередня відповідь порушила формат/якість. "
+                    "Суворо: note НЕ може повторювати назву критерію; "
+                    "coaching.top_issues — лише недоліки оператора, не тема дзвінка; "
+                    "8 елементів checklist; low confidence => не ok; без зайвих ключів."
+                )
+            )
+        )
         ok, _ = _validate(obj)
 
         if not ok:
-            # fallback без JSON-каші
-            fallback_check = "❌ Не вдалося отримати валідний аналіз (формат порушено)."
-            fallback_sum = "Не вдалося отримати структуроване резюме (fallback)."
-            return (fallback_check, fallback_sum, "Інше", 0, {"error": "invalid_format"})
+            return (
+                "❌ Не вдалося отримати валідний аналіз (формат/якість порушено).",
+                "Не вдалося отримати структуроване резюме (fallback).",
+                "Інше",
+                0,
+                {"error": "invalid_format"},
+            )
 
-    # Формуємо красивий вивід
     cl = obj["checklist"]
     summary = (obj.get("summary") or "").strip()
     tag = obj.get("tag") or "Інше"
     coaching = obj.get("coaching") or {}
     risks = obj.get("risk_flags") or []
 
-    lines = []
+    lines: list[str] = []
     score = 0
 
     for i, item in enumerate(cl):
@@ -583,13 +609,15 @@ OUTRO:
         if st == "ok":
             score += 1
 
-        base_line = f"{emoji} {labels[i]}: {note} (conf {conf:.2f})"
-        lines.append(base_line)
+        lines.append(f"{emoji} {labels[i]}: {note} (conf {conf:.2f})")
 
         if SHOW_EVIDENCE_IN_TG and ev:
             lines.append(f"    <i>«{html_escape(ev)}»</i>")
 
-    # Coaching + risks (коротко)
+    checklist_html = "\n".join(html_escape(x) if not x.strip().startswith("<i>") else x for x in lines)
+    summary_html = html_escape(summary if summary else "Немає короткого резюме.")
+
+    # coaching
     coach_block = ""
     try:
         ti = coaching.get("top_issues") or []
@@ -597,21 +625,18 @@ OUTRO:
         if ti and tip:
             coach_block = (
                 "\n\n<b>Що покращити:</b>\n"
-                f"• {html_escape(ti[0])}\n"
-                f"• {html_escape(ti[1])}\n"
-                f"<b>Порада:</b> {html_escape(tip)}"
+                f"• {html_escape(str(ti[0]))}\n"
+                f"• {html_escape(str(ti[1]))}\n"
+                f"<b>Порада:</b> {html_escape(str(tip))}"
             )
     except Exception:
         coach_block = ""
 
+    # risks
     risk_block = ""
     if risks:
         risk_block = "\n\n<b>Ризики:</b>\n" + "\n".join([f"• {html_escape(x)}" for x in risks[:6]])
 
-    checklist_html = "\n".join(html_escape(x) if not x.strip().startswith("<i>") else x for x in lines)
-    summary_html = html_escape(summary if summary else "Немає короткого резюме.")
-
-    # Дописуємо coaching/risks в кінець аналізу (читабельно в TG)
     checklist_html = checklist_html + coach_block + risk_block
 
     return checklist_html, summary_html, str(tag), int(score), obj
@@ -837,9 +862,8 @@ def process():
 
     state = load_state()
 
-    # антидубль: не обробляти один call_id двічі навіть при рестартах/двох тіках
-    processed = state.get("processed_call_ids") or []
-    processed_set = set(processed)
+    processed_list = state.get("processed_call_ids") or []
+    processed_set = set(processed_list)
 
     calls = b24_vox_get_latest(LIMIT_LAST)
     if not calls:
@@ -858,7 +882,9 @@ def process():
             phone = c.phone_number or "—"
             link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
-            checklist_html, summary_html, tag, score, analysis_obj = analyze_and_summarize(transcript, call_duration_sec=c.duration)
+            checklist_html, summary_html, tag, score, analysis_obj = analyze_and_summarize(
+                transcript, call_duration_sec=c.duration
+            )
 
             header = f"AI: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             body = (
@@ -866,6 +892,7 @@ def process():
                 f"<b>ПІБ:</b> {html_escape(name)}\n"
                 f"<b>Телефон:</b> {html_escape(phone)}\n"
                 f"<b>CRM:</b> <a href='{html_escape(link)}'>відкрити</a>\n"
+                f"<b>CALL_ID:</b> <code>{html_escape(c.call_id)}</code>\n"
                 f"<b>Початок:</b> {html_escape(c.call_start)}\n"
                 f"<b>Тривалість:</b> {c.duration}s\n"
                 f"<b>Тема:</b> {html_escape(tag)} | <b>Бал:</b> {score}/8\n\n"
@@ -874,12 +901,16 @@ def process():
             )
             tg_send_message(f"{header}\n\n{body}")
 
-            # позначаємо обробленим
+            # позначаємо обробленим (черга)
+            processed_list.append(c.call_id)
             processed_set.add(c.call_id)
-            state["processed_call_ids"] = list(processed_set)[-PROCESSED_KEEP:]
+            if len(processed_list) > PROCESSED_KEEP:
+                processed_list = processed_list[-PROCESSED_KEEP:]
+                processed_set = set(processed_list)
+
+            state["processed_call_ids"] = processed_list
             save_state(state)
 
-            # summary_plain для CSV/аналітики без HTML
             summary_plain = _strip_html(summary_html)
 
             _append_call_record(
@@ -893,7 +924,7 @@ def process():
                     "score": score,
                     "summary": summary_html,
                     "summary_plain": summary_plain,
-                    "analysis": analysis_obj,  # ✅ повний ultimate JSON для майбутнього
+                    "analysis": analysis_obj,
                 }
             )
 
