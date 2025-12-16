@@ -5,8 +5,8 @@ Bitrix24 → Whisper → Telegram monitor (real-time, weekly analytics, safe imp
 - Тягне останні дзвінки з Bitrix24 (voximplant.statistic.get через total→start)
 - Фільтрує тільки вхідні (або за env) + мінімальна тривалість
 - Скачує запис, перевіряє MIME/розмір, транскрибує Whisper'ом (uk + підказка)
-- ОДИН запит до OpenAI (chat): чек-лист 8 критеріїв + коротке резюме + tag + score
-- Шле у Telegram: короткий підсумок у першому рядку + структурований аналіз
+- ОДИН запит до OpenAI (chat): FACTS → EVAL (8 критеріїв) + summary + tag + coaching + risks
+- Шле у Telegram: короткий підсумок + структурований аналіз + (evidence за бажанням)
 - Пише кожен дзвінок у JSONL (calls_week.jsonl)
 - Раз на тиждень (Fri 18:00 Europe/Kyiv) шле тижневий звіт + CSV
 - Без fail-fast на імпорті: секрети перевіряються всередині process()
@@ -36,7 +36,10 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
 
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+
+# якщо ціна не проблема — за замовчуванням беремо сильну модель
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
+
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
@@ -54,6 +57,12 @@ WEEKLY_KEEP_DAYS = int(os.getenv("WEEKLY_KEEP_DAYS", "35"))
 CALLS_FILE = os.getenv("CALLS_FILE", "calls_week.jsonl")
 WEEKLY_STATE_FILE = os.getenv("WEEKLY_STATE_FILE", "weekly_state.json")
 CSV_FILENAME = os.getenv("WEEKLY_CSV_NAME", "weekly_calls.csv")
+
+# керування тим, чи показувати цитати у Telegram
+SHOW_EVIDENCE_IN_TG = (os.getenv("SHOW_EVIDENCE_IN_TG", "false").lower() == "true")
+
+# скільки processed_call_ids тримати в state (антидубль)
+PROCESSED_KEEP = int(os.getenv("PROCESSED_KEEP", "800"))
 
 if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith("/"):
     BITRIX_WEBHOOK_BASE += "/"
@@ -96,6 +105,13 @@ def _require_env(name: str) -> bool:
         print(f"[monitor] WARN missing env {name}", flush=True)
         return False
     return True
+
+
+def _strip_html(s: str) -> str:
+    # дуже простий “strip” для наших summary (де HTML мінімальний)
+    s = (s or "")
+    s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return s
 
 
 # -------------------- Bitrix24 --------------------
@@ -220,11 +236,6 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
 
 # -------------------- Audio fetch (safe + memory friendly) --------------------
 def fetch_audio(url: str, max_mb: int = 25) -> tuple[bytes, str, str]:
-    """
-    Завантажує запис з перевірками.
-    Повертає: (bytes, mime, suggest_filename)
-    Кидає виняток, якщо це не аудіо або великий файл.
-    """
     headers = {"User-Agent": "ai-crm-analytics/1.0", "Accept": "*/*"}
     max_bytes = max_mb * 1024 * 1024
 
@@ -319,19 +330,48 @@ def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3", mime: st
     return (r.json().get("text", "") or "").strip()
 
 
-# -------------------- OpenAI: One-shot analysis + summary (stable schema) --------------------
-def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
+# -------------------- Analysis helpers --------------------
+def _segment_transcript(text: str) -> dict:
     """
-    Повертає (html_checklist, html_summary, tag, score_0_8).
+    Просте сегментування без таймкодів:
+    intro ~ перші 1200 символів, outro ~ останні 1200, middle ~ середина.
+    """
+    t = (text or "").strip()
+    if not t:
+        return {"intro": "", "middle": "", "outro": ""}
 
-    Важливо: тепер checklist — НЕ “рядки”, а об’єкти зі status/note.
-    Це усуває крихкість типу “Не перебивав/Не перебивала”.
+    n = len(t)
+    intro_len = min(1200, n)
+    outro_len = min(1200, max(0, n - intro_len))
+
+    intro = t[:intro_len].strip()
+    outro = t[-outro_len:].strip() if outro_len > 0 else t[-min(600, n):].strip()
+
+    if n <= intro_len + outro_len + 50:
+        middle = t[intro_len:].strip()
+    else:
+        mid_start = max(intro_len, (n // 2) - 1200)
+        mid_end = min(n - outro_len, (n // 2) + 1200)
+        middle = t[mid_start:mid_end].strip()
+
+    return {"intro": intro, "middle": middle, "outro": outro}
+
+
+# -------------------- OpenAI: Ultimate analysis (facts+evidence+confidence+coaching) --------------------
+def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = None) -> tuple[str, str, str, int, dict]:
+    """
+    Повертає:
+      (html_checklist, html_summary, tag, score_0_8, analysis_obj)
+
+    analysis_obj кладемо в JSONL для майбутнього дашборду/QA.
     """
     if not transcript:
-        return ("Немає транскрипту для аналізу.", "Немає даних для резюме.", "Інше", 0)
+        return ("Немає транскрипту для аналізу.", "Немає даних для резюме.", "Інше", 0, {"error": "empty_transcript"})
 
     if MAX_TRANSCRIPT_CHARS > 0 and len(transcript) > MAX_TRANSCRIPT_CHARS:
         transcript = transcript[:MAX_TRANSCRIPT_CHARS] + " …(урізано для економії токенів)"
+
+    seg = _segment_transcript(transcript)
 
     allowed_tags = [
         "Технічна проблема",
@@ -359,23 +399,29 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
 
     def _build_messages(fix_note: str = ""):
         system = (
-            "Ти — провідний аналітик якості дзвінків кол-центру. Бог своєї справи. Роби аналіз дзвінків вхідної лініії.  Відповідай тільки УКРАЇНСЬКОЮ. "
-            "ПОВЕРТАЙ СУВОРО JSON (без жодного тексту поза JSON). "
-            "Структура: {"
-            "\"checklist\":[{\"status\":\"ok|partial|fail\",\"note\":\"...\"} x8], "
-            "\"summary\":\"...\", \"tag\":\"...\"}. "
-            f"Поле tag — ОДИН зі списку: {', '.join(allowed_tags)}. "
-            "checklist МАЄ містити рівно 8 елементів У ПОРЯДКУ критеріїв. "
-            "status ТІЛЬКИ: ok / partial / fail. "
-            "note: 6–200 символів, конкретно, без односкладових «Так/Ні/Ок». "
-            "НЕ повертай markdown, НЕ додавай зайві поля."
-            + (f" ДОДАТКОВО: {fix_note}" if fix_note else "")
+            "Ти — провідний QA-аналітик кол-центру. Відповідай ТІЛЬКИ УКРАЇНСЬКОЮ. "
+            "ПОВЕРТАЙ СУВОРО JSON (без будь-якого тексту поза JSON). "
+            "ЗАБОРОНЕНО вигадувати факти: якщо ознаки немає в тексті — так і скажи, evidence може бути порожнім. "
+            "Якщо не впевнений — став partial або fail, а не ok. "
+            "Формат відповіді СУВОРО такий:\n"
+            "{\n"
+            "  \"facts\": { ... },\n"
+            "  \"checklist\": [\n"
+            "     {\"status\":\"ok|partial|fail\",\"note\":\"6-220 символів\",\"evidence\":\"0-180 символів\",\"confidence\":0.0-1.0},\n"
+            "     ... (8 елементів)\n"
+            "  ],\n"
+            "  \"summary\": \"1-2 речення БЕЗ оцінок\",\n"
+            "  \"tag\": \"один із дозволених\",\n"
+            "  \"coaching\": {\"top_issues\":[\"...\",\"...\"],\"one_sentence_tip\":\"...\"},\n"
+            "  \"risk_flags\": [\"...\"]\n"
+            "}\n"
+            "НЕ додавай інших ключів. НЕ використовуй markdown.\n"
+            f"Дозволені tag: {', '.join(allowed_tags)}.\n"
+            + (f"ДОДАТКОВО: {fix_note}" if fix_note else "")
         )
 
         user = f"""
-Оціни розмову за 8 критеріями (строго в такій послідовності) і дай стислий підсумок (1–2 речення).
-Поверни СТРОГО JSON.
-
+Зроби аналіз вхідного дзвінка за 8 критеріями у заданому форматі.
 Критерії (порядок незмінний):
 1) {labels[0]}
 2) {labels[1]}
@@ -386,15 +432,28 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
 7) {labels[6]}
 8) {labels[7]}
 
-Вимоги:
-- checklist: рівно 8 елементів
-- кожен елемент: {{"status":"ok|partial|fail","note":"6–200 символів"}}
-- summary: 1–2 речення без оцінок
-- tag: один із дозволених
+Важливо:
+- evidence: коротка цитата з транскрипту, яка підтверджує висновок (або "" якщо цитати нема/нечутно).
+- confidence: 0..1. Якщо confidence < 0.6, статус НЕ може бути "ok".
+- facts: максимально об’єктивні факти без оцінок (наприклад: чи представився оператор, чи озвучив строки, чи був upsell).
+- coaching: 2 головні проблеми + 1 порада (1 речення).
+- risk_flags: короткі маркери ризиків, напр. ["клієнт незадоволений","потрібна ескалація","незрозумілий запит"] або [].
 
-Транскрипт:
+Контекст:
+- Тривалість дзвінка (сек): {call_duration_sec if call_duration_sec is not None else "невідомо"}
+
+Транскрипт (сегменти):
+INTRO:
 ---
-{transcript}
+{seg["intro"]}
+---
+MIDDLE:
+---
+{seg["middle"]}
+---
+OUTRO:
+---
+{seg["outro"]}
 ---
 """
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -405,13 +464,12 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
         payload = {
             "model": OPENAI_CHAT_MODEL,
             "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 750,
+            "temperature": 0.15,
+            "max_tokens": 1100,
             "response_format": {"type": "json_object"},
         }
         r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
         if r.status_code >= 400:
-            # корисно мати body при дебазі
             print(f"[openai] chat {r.status_code} -> {r.text[:2000]}", flush=True)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
@@ -421,24 +479,45 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
         if not isinstance(obj, dict):
             return False, "root not object"
 
+        if "facts" not in obj or not isinstance(obj["facts"], dict):
+            return False, "facts missing or not object"
+
         cl = obj.get("checklist")
         if not isinstance(cl, list) or len(cl) != 8:
-            return False, "checklist must be list of length 8"
+            return False, "checklist must be list length 8"
 
         for i, item in enumerate(cl):
             if not isinstance(item, dict):
                 return False, f"checklist[{i}] not object"
+
             st = item.get("status")
             note = item.get("note")
+            ev = item.get("evidence", "")
+            conf = item.get("confidence")
+
             if st not in ("ok", "partial", "fail"):
                 return False, f"checklist[{i}].status invalid"
+
             if not isinstance(note, str):
                 return False, f"checklist[{i}].note not string"
             note_s = note.strip()
-            if len(note_s) < 6:
-                return False, f"checklist[{i}].note too short"
-            if len(note_s) > 200:
-                return False, f"checklist[{i}].note too long"
+            if len(note_s) < 6 or len(note_s) > 220:
+                return False, f"checklist[{i}].note bad length"
+
+            if not isinstance(ev, str):
+                return False, f"checklist[{i}].evidence not string"
+            if len(ev) > 180:
+                return False, f"checklist[{i}].evidence too long"
+
+            if not isinstance(conf, (int, float)):
+                return False, f"checklist[{i}].confidence not number"
+            if conf < 0 or conf > 1:
+                return False, f"checklist[{i}].confidence out of range"
+
+            # анти-галюцинація: якщо low confidence — не ok
+            if conf < 0.6 and st == "ok":
+                return False, f"checklist[{i}] ok with low confidence"
+
             if note_s.lower() in ("так", "ні", "ок", "добре"):
                 return False, f"checklist[{i}] trivial note"
 
@@ -450,6 +529,20 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
         if not isinstance(summary, str) or len(summary.strip()) < 10:
             return False, "summary too short"
 
+        coaching = obj.get("coaching")
+        if not isinstance(coaching, dict):
+            return False, "coaching missing"
+        top_issues = coaching.get("top_issues")
+        tip = coaching.get("one_sentence_tip")
+        if not isinstance(top_issues, list) or len(top_issues) != 2 or not all(isinstance(x, str) and x.strip() for x in top_issues):
+            return False, "coaching.top_issues invalid"
+        if not isinstance(tip, str) or len(tip.strip()) < 10:
+            return False, "coaching.one_sentence_tip invalid"
+
+        risk_flags = obj.get("risk_flags")
+        if not isinstance(risk_flags, list) or not all(isinstance(x, str) for x in risk_flags):
+            return False, "risk_flags invalid"
+
         return True, ""
 
     # 1-й виклик
@@ -457,53 +550,75 @@ def analyze_and_summarize(transcript: str) -> tuple[str, str, str, int]:
     ok, _ = _validate(obj)
 
     if not ok:
-        # 2-й (останній) повтор із жорсткішим наголосом
-        obj = _call_openai(
-            _build_messages(
-                fix_note=(
-                    "Попередня відповідь НЕ відповідала формату. "
-                    "Суворо: checklist рівно 8 об’єктів, status лише ok|partial|fail, "
-                    "note 6–200 символів; без markdown/зайвих полів."
-                )
-            )
-        )
+        # 2-й виклик — посилення дисципліни
+        obj = _call_openai(_build_messages(
+            fix_note="Попередня відповідь порушила формат. Суворо дотримуйся схеми. "
+                     "8 елементів checklist, confidence 0..1, low confidence => не ok, evidence <=180, жодних зайвих ключів."
+        ))
         ok, _ = _validate(obj)
 
         if not ok:
-            # без JSON-каші — людський fallback
-            return (
-                "❌ Не вдалося отримати валідний чек-лист (формат порушено).",
-                "Не вдалося отримати структуроване резюме (fallback).",
-                "Інше",
-                0,
-            )
+            # fallback без JSON-каші
+            fallback_check = "❌ Не вдалося отримати валідний аналіз (формат порушено)."
+            fallback_sum = "Не вдалося отримати структуроване резюме (fallback)."
+            return (fallback_check, fallback_sum, "Інше", 0, {"error": "invalid_format"})
 
+    # Формуємо красивий вивід
     cl = obj["checklist"]
     summary = (obj.get("summary") or "").strip()
     tag = obj.get("tag") or "Інше"
+    coaching = obj.get("coaching") or {}
+    risks = obj.get("risk_flags") or []
 
     lines = []
     score = 0
+
     for i, item in enumerate(cl):
         st = item.get("status")
         note = (item.get("note") or "").strip()
+        ev = (item.get("evidence") or "").strip()
+        conf = float(item.get("confidence") or 0.0)
+
         emoji = status_to_emoji.get(st, "⚠️")
         if st == "ok":
             score += 1
-        # Канонічний лейбл з твого коду (без залежності від LLM)
-        lines.append(f"{emoji} {labels[i]}: {note}")
 
-    checklist_html = "\n".join(html_escape(x) for x in lines)
+        base_line = f"{emoji} {labels[i]}: {note} (conf {conf:.2f})"
+        lines.append(base_line)
+
+        if SHOW_EVIDENCE_IN_TG and ev:
+            lines.append(f"    <i>«{html_escape(ev)}»</i>")
+
+    # Coaching + risks (коротко)
+    coach_block = ""
+    try:
+        ti = coaching.get("top_issues") or []
+        tip = coaching.get("one_sentence_tip") or ""
+        if ti and tip:
+            coach_block = (
+                "\n\n<b>Що покращити:</b>\n"
+                f"• {html_escape(ti[0])}\n"
+                f"• {html_escape(ti[1])}\n"
+                f"<b>Порада:</b> {html_escape(tip)}"
+            )
+    except Exception:
+        coach_block = ""
+
+    risk_block = ""
+    if risks:
+        risk_block = "\n\n<b>Ризики:</b>\n" + "\n".join([f"• {html_escape(x)}" for x in risks[:6]])
+
+    checklist_html = "\n".join(html_escape(x) if not x.strip().startswith("<i>") else x for x in lines)
     summary_html = html_escape(summary if summary else "Немає короткого резюме.")
 
-    return checklist_html, summary_html, str(tag), int(score)
+    # Дописуємо coaching/risks в кінець аналізу (читабельно в TG)
+    checklist_html = checklist_html + coach_block + risk_block
+
+    return checklist_html, summary_html, str(tag), int(score), obj
 
 
 # -------------------- Telegram --------------------
 def tg_send_message(text: str) -> None:
-    """
-    Відправляє повідомлення. Якщо довше за ~3500 символів — ріже на частини.
-    """
     try:
         if TG_BOT_TOKEN.startswith("sk-"):
             print("[tg] ERROR: TG_BOT_TOKEN схожий на OpenAI ключ (sk-...). Замініть на токен BotFather.", flush=True)
@@ -667,7 +782,6 @@ def _send_weekly_report():
             w = csv.DictWriter(f, fieldnames=["ts", "call_id", "name", "phone", "duration", "tag", "score", "summary"])
             w.writeheader()
             for it in window:
-                # summary в CSV — без HTML
                 summary_plain = (it.get("summary_plain") or it.get("summary") or "")
                 w.writerow(
                     {
@@ -687,10 +801,6 @@ def _send_weekly_report():
 
 
 def _maybe_send_weekly_report():
-    """
-    Було крихко: “рівно о 18:00”.
-    Стало: якщо сьогодні потрібний день і зараз >= 18:00 та ще не слали цього тижня — шлемо.
-    """
     st = _load_weekly_state()
     now = _now_kyiv()
     week_key = _iso_week_key(now)
@@ -699,7 +809,6 @@ def _maybe_send_weekly_report():
         return
     if now.hour < WEEKLY_REPORT_HOUR:
         return
-
     if st.get("last_sent_week") == week_key:
         return
 
@@ -727,7 +836,10 @@ def process():
         return
 
     state = load_state()
-    last_seen = state.get("last_seen_call_id")
+
+    # антидубль: не обробляти один call_id двічі навіть при рестартах/двох тіках
+    processed = state.get("processed_call_ids") or []
+    processed_set = set(processed)
 
     calls = b24_vox_get_latest(LIMIT_LAST)
     if not calls:
@@ -735,8 +847,9 @@ def process():
         return
 
     for c in calls:
-        if c.call_id == last_seen:
+        if c.call_id in processed_set:
             continue
+
         try:
             audio, mime, fname = fetch_audio(c.record_url, max_mb=MAX_AUDIO_MB)
             transcript = transcribe_whisper(audio, filename=fname, mime=mime)
@@ -745,7 +858,7 @@ def process():
             phone = c.phone_number or "—"
             link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
-            checklist_html, summary_html, tag, score = analyze_and_summarize(transcript)
+            checklist_html, summary_html, tag, score, analysis_obj = analyze_and_summarize(transcript, call_duration_sec=c.duration)
 
             header = f"AI: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             body = (
@@ -761,11 +874,13 @@ def process():
             )
             tg_send_message(f"{header}\n\n{body}")
 
-            state["last_seen_call_id"] = c.call_id
+            # позначаємо обробленим
+            processed_set.add(c.call_id)
+            state["processed_call_ids"] = list(processed_set)[-PROCESSED_KEEP:]
             save_state(state)
 
             # summary_plain для CSV/аналітики без HTML
-            summary_plain = (summary_html or "").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            summary_plain = _strip_html(summary_html)
 
             _append_call_record(
                 {
@@ -778,6 +893,7 @@ def process():
                     "score": score,
                     "summary": summary_html,
                     "summary_plain": summary_plain,
+                    "analysis": analysis_obj,  # ✅ повний ultimate JSON для майбутнього
                 }
             )
 
