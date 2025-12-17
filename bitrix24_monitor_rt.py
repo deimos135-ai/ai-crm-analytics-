@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 Bitrix24 → Whisper → Telegram monitor (real-time, weekly analytics, safe import)
@@ -1040,4 +1039,3 @@ def process():
 
 if __name__ == "__main__":
     process()
-```
