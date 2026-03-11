@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Bitrix24 → Whisper → Telegram monitor (real-time, weekly analytics, safe import)
+Bitrix24 -> Whisper -> Telegram monitor (real-time, weekly analytics, safe import)
 
-- Тягне останні дзвінки з Bitrix24 (voximplant.statistic.get через total→start)
-- Фільтрує тільки вхідні (або за env) + мінімальна тривалість
-- Скачує запис, перевіряє MIME/розмір, транскрибує Whisper'ом (uk + підказка)
-- ОДИН запит до OpenAI (chat): FACTS → EVAL (8 критеріїв) + summary + tag + coaching + risks
-- Додає "Trust" (довіра) як метрику: transcript_trust, analysis_trust, overall_trust
-- Шле у Telegram: короткий підсумок + структурований аналіз (+ evidence опційно)
-- Пише кожен дзвінок у JSONL (calls_week.jsonl)
-- Раз на тиждень (Fri 18:00 Europe/Kyiv) шле тижневий звіт + CSV
-- Без fail-fast на імпорті: секрети перевіряються всередині process()
+Оновлено під нові вимоги:
+- 8 QA критеріїв у форматі binary score 0/1
+- 10 тем звернень
+- Додаткові бізнес-метрики:
+  - root_reason
+  - resolved_on_first_contact
+  - repeat_contact_signal
+  - churn_risk
+  - customer_emotion
+  - next_step_promised
+  - deadline_promised
+- Розширений weekly report:
+  - FCR
+  - повторні звернення
+  - ризик відтоку
+  - топ причин звернень
+  - найслабші критерії команди
 """
 
 import os
@@ -34,13 +42,10 @@ BITRIX_WEBHOOK_BASE = os.getenv("BITRIX_WEBHOOK_BASE", "")  # must end with '/'
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-LIMIT_LAST = int(os.getenv("LIMIT_LAST", "1"))
+LIMIT_LAST = int(os.getenv("LIMIT_LAST", "10"))
 
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
-
-# Якщо ціна не проблема — сильна модель (можна оверрайднути env’ом)
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
-
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
@@ -59,10 +64,7 @@ CALLS_FILE = os.getenv("CALLS_FILE", "calls_week.jsonl")
 WEEKLY_STATE_FILE = os.getenv("WEEKLY_STATE_FILE", "weekly_state.json")
 CSV_FILENAME = os.getenv("WEEKLY_CSV_NAME", "weekly_calls.csv")
 
-# Чи показувати evidence (цитати) в TG
 SHOW_EVIDENCE_IN_TG = (os.getenv("SHOW_EVIDENCE_IN_TG", "false").lower() == "true")
-
-# Скільки processed_call_ids тримати у state
 PROCESSED_KEEP = int(os.getenv("PROCESSED_KEEP", "800"))
 
 if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith("/"):
@@ -89,10 +91,6 @@ def html_escape(s: str) -> str:
 
 
 def http_post_json(url: str, payload: dict) -> dict:
-    """
-    Bitrix при помилках часто повертає корисний body.
-    Логуємо його, щоб не гадати “чому 401/403/500”.
-    """
     resp = requests.post(url, json=payload, timeout=TIMEOUT)
     if resp.status_code >= 400:
         print(f"[http] {resp.status_code} POST {url} -> {resp.text[:2000]}", flush=True)
@@ -121,50 +119,56 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+def _to_bool_text_ua(v: t.Optional[bool]) -> str:
+    if v is True:
+        return "так"
+    if v is False:
+        return "ні"
+    return "невідомо"
+
+
+def _mask_phone(phone: str) -> str:
+    p = re.sub(r"\D", "", phone or "")
+    if len(p) >= 4:
+        return f"+***{p[-4:]}"
+    return phone or "—"
+
+
 # -------------------- Trust metrics --------------------
 def compute_transcript_trust(transcript: str, duration_sec: t.Optional[int]) -> int:
-    """
-    0..100, евристика якості транскрипту (без word-level confidence).
-    Основна ідея: якщо текст підозріло короткий для тривалості -> низька довіра.
-    """
     if not transcript:
         return 0
 
     words = len(re.findall(r"[A-Za-zА-Яа-яІіЇїЄє0-9']+", transcript))
     if not duration_sec or duration_sec <= 0:
-        # Якщо немає тривалості — грубо по довжині
-        # 1200+ символів ~ пристойно
         return int(round(_clamp((len(transcript) / 1200) * 100, 20, 95)))
 
     minutes = duration_sec / 60.0
-    expected = max(30, int(minutes * 120))  # 120 wpm baseline
+    expected = max(30, int(minutes * 120))
     ratio = _clamp(words / expected, 0.0, 1.2)
 
-    # ratio 0.9+ -> ~100, ratio 0.45 -> ~50
     trust = 100 * _clamp(ratio / 0.9, 0.0, 1.0)
     return int(round(trust))
 
 
 def compute_analysis_trust(analysis_obj: dict) -> int:
-    """
-    0..100: довіра до висновків на основі checklist (status+confidence).
-    """
     cl = analysis_obj.get("checklist") or []
     if not isinstance(cl, list) or not cl:
         return 0
-
-    def w(status: str) -> float:
-        return {"ok": 1.0, "partial": 0.6, "fail": 0.3}.get(status, 0.5)
 
     contrib = []
     for it in cl:
         if not isinstance(it, dict):
             continue
-        status = str(it.get("status") or "")
+        score = it.get("score")
         conf = it.get("confidence")
+        if score not in (0, 1):
+            continue
         if not isinstance(conf, (int, float)):
             conf = 0.0
-        contrib.append(w(status) * float(conf))
+
+        base = 1.0 if score == 1 else 0.7
+        contrib.append(base * float(conf))
 
     if not contrib:
         return 0
@@ -174,16 +178,10 @@ def compute_analysis_trust(analysis_obj: dict) -> int:
 
 
 def compute_overall_trust(transcript_trust: int, analysis_trust: int) -> int:
-    """
-    Загальна довіра — “чесна”: обмежуємося найслабшою ланкою.
-    """
     return min(int(transcript_trust), int(analysis_trust))
 
 
 def trust_badge(overall: int) -> tuple[str, str]:
-    """
-    (emoji, label)
-    """
     if overall >= 85:
         return "✅", "висока"
     if overall >= 60:
@@ -437,7 +435,7 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
       (html_checklist, html_summary, tag, score_0_8, analysis_obj)
     """
     if not transcript:
-        return ("Немає транскрипту для аналізу.", "Немає даних для резюме.", "Інше", 0, {"error": "empty_transcript"})
+        return ("Немає транскрипту для аналізу.", "Немає даних для резюме.", "Інформаційні звернення", 0, {"error": "empty_transcript"})
 
     if MAX_TRANSCRIPT_CHARS > 0 and len(transcript) > MAX_TRANSCRIPT_CHARS:
         transcript = transcript[:MAX_TRANSCRIPT_CHARS] + " …(урізано для економії токенів)"
@@ -445,75 +443,147 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
     seg = _segment_transcript(transcript)
 
     allowed_tags = [
-        "Технічна проблема",
-        "Платежі/рахунок",
-        "Підключення/тарифи",
-        "Доставка/візит",
-        "Підтримка акаунта",
-        "Скарга",
-        "Загальне питання",
-        "Інше",
+        "Технічні проблеми",
+        "Тарифи",
+        "Підключення",
+        "Платежі / рахунок",
+        "Скарги",
+        "Повторні звернення",
+        "Ризик відтоку / утримання",
+        "Інформаційні звернення",
+        "Продаж / допродаж",
+        "Організаційні питання",
     ]
 
     labels = [
-        "Привітання по скрипту",
-        "З’ясування суті звернення",
-        "Ввічливість і емпатія",
-        "Не перебивав",
-        "Рішення",
-        "Наступні дії або строки",
-        "Допомога",
-        "Завершення",
+        "Привітався по скрипту",
+        "Чітко з’ясував суть звернення",
+        "Проявив ввічливість і емпатію",
+        "Не перебивав, не говорив агресивно",
+        "Правильно надав відповідь / рішення",
+        "Пояснив наступні дії або строки",
+        "Запропонував допомогу наприкінці",
+        "Подякував і завершив розмову коректно",
     ]
-
-    status_to_emoji = {"ok": "✅", "partial": "⚠️", "fail": "❌"}
 
     def _build_messages(fix_note: str = ""):
         system = (
-            "Ти — провідний QA-аналітик кол-центру (оцінка якості роботи оператора). "
+            "Ти — провідний QA-аналітик кол-центру. "
             "Відповідай ТІЛЬКИ УКРАЇНСЬКОЮ. "
-            "ПОВЕРТАЙ СУВОРО JSON (без будь-якого тексту поза JSON). "
-            "ЗАБОРОНЕНО вигадувати факти: якщо ознаки немає в тексті — так і скажи, evidence може бути порожнім. "
-            "Якщо не впевнений — став partial або fail, а не ok. "
-            "Формат відповіді СУВОРО такий:\n"
+            "ПОВЕРТАЙ СУВОРО JSON без тексту поза JSON. "
+            "ЗАБОРОНЕНО вигадувати факти: якщо ознаки немає в тексті або вона нечітка — став 0. "
+            "Оцінка по кожному критерію тільки 0 або 1. "
+            "1 = критерій чітко виконаний і є підтвердження в тексті. "
+            "0 = не виконаний, сумнівний або бракує доказів. "
+            "Якщо не впевнений — став 0. "
+            "Якщо з транскрипту не видно, чи оператор перебивав, — став 0 по критерію про перебивання. "
+            "Поверни рівно такий JSON-об'єкт:\n"
             "{\n"
-            "  \"facts\": { ... },\n"
+            "  \"facts\": {\n"
+            "    \"operator_introduced_self\": true,\n"
+            "    \"operator_named_company\": true,\n"
+            "    \"clarified_issue\": true,\n"
+            "    \"showed_empathy\": true,\n"
+            "    \"gave_solution\": true,\n"
+            "    \"mentioned_deadline\": false,\n"
+            "    \"offered_extra_help\": false,\n"
+            "    \"closed_politely\": true\n"
+            "  },\n"
             "  \"checklist\": [\n"
-            "     {\"status\":\"ok|partial|fail\",\"note\":\"6-220 символів\",\"evidence\":\"0-180 символів\",\"confidence\":0.0-1.0},\n"
-            "     ... (8 елементів)\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0},\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0},\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0},\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0},\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0},\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0},\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0},\n"
+            "    {\"score\":0,\"note\":\"...\",\"evidence\":\"...\",\"confidence\":0.0}\n"
             "  ],\n"
-            "  \"summary\": \"1-2 речення БЕЗ оцінок\",\n"
-            "  \"tag\": \"один із дозволених\",\n"
-            "  \"coaching\": {\"top_issues\":[\"...\",\"...\"],\"one_sentence_tip\":\"...\"},\n"
+            "  \"summary\": \"...\",\n"
+            "  \"tag\": \"...\",\n"
+            "  \"root_reason\": \"...\",\n"
+            "  \"resolved_on_first_contact\": true,\n"
+            "  \"repeat_contact_signal\": false,\n"
+            "  \"churn_risk\": \"low\",\n"
+            "  \"customer_emotion\": \"neutral\",\n"
+            "  \"next_step_promised\": \"...\",\n"
+            "  \"deadline_promised\": \"...\",\n"
+            "  \"coaching\": {\n"
+            "    \"top_issues\": [\"...\", \"...\"],\n"
+            "    \"one_sentence_tip\": \"...\"\n"
+            "  },\n"
             "  \"risk_flags\": [\"...\"]\n"
             "}\n"
-            "НЕ додавай інших ключів. НЕ використовуй markdown.\n"
-            f"Дозволені tag: {', '.join(allowed_tags)}.\n"
+            f"Дозволені tag: {', '.join(allowed_tags)}. "
+            "Пріоритет tag при змішаних темах: "
+            "1) Ризик відтоку / утримання, "
+            "2) Повторні звернення, "
+            "3) Скарги, "
+            "4) Продаж / допродаж, "
+            "5) Підключення, "
+            "6) Тарифи, "
+            "7) Платежі / рахунок, "
+            "8) Організаційні питання, "
+            "9) Інформаційні звернення, "
+            "10) Технічні проблеми. "
+            "Якщо клієнт скаржиться на майстра, оператора, довге вирішення або сервіс — tag = 'Скарги'. "
+            "Якщо клієнт прямо каже, що звертається повторно з того ж питання — tag = 'Повторні звернення'. "
+            "Якщо клієнт говорить про відключення, конкурента, розірвання договору, утримання — tag = 'Ризик відтоку / утримання'. "
             + (f"ДОДАТКОВО: {fix_note}" if fix_note else "")
         )
 
         user = f"""
 Зроби аналіз ВХІДНОГО дзвінка за 8 критеріями у заданому форматі.
-Критерії (порядок незмінний):
-1) {labels[0]}
-2) {labels[1]}
-3) {labels[2]}
-4) {labels[3]}
-5) {labels[4]}
-6) {labels[5]}
-7) {labels[6]}  (чи оператор уточнив, чи всі питання вирішені, і запропонував допомогу "Чи можу ще чимось допомогти?")
-8) {labels[7]}
 
-Важливо:
-- note: КОНКРЕТНЕ пояснення (НЕ повторюй назву критерію).
-- evidence: коротка цитата, що підтверджує висновок (або "" якщо немає/нечутно).
-- confidence: 0..1. Якщо confidence < 0.6, статус НЕ може бути "ok".
-- facts: об’єктивні факти без оцінок (представився/уточнював/дав рішення/дав строки/завершив тощо).
-- coaching.top_issues: це 2 недоліки саме роботи оператора (скрипт/комунікація/наступні кроки/допомога/завершення).
-  НЕ пиши сюди тему дзвінка чи проблему клієнта (типу "немає інтернету", "закінчились кошти").
-  Якщо суттєвих недоліків немає: ["Немає суттєвих зауважень","—"].
-- coaching.one_sentence_tip: 1 речення, що реально допоможе оператору.
-- risk_flags: короткі маркери ризиків (незадоволення/ескалація/незрозуміло/не вирішено), або [].
+Критерії (порядок незмінний):
+1) Привітався по скрипту
+Вимога: оператор чітко назвав себе і компанію, бажано у формі:
+"Добрий день, мене звати [Ім’я], компанія [назва]. Чим можу допомогти?"
+Якщо назвав тільки ім’я без компанії — 0.
+Якщо привітання формальне або неповне — 0.
+
+2) Чітко з’ясував суть звернення
+Вимога: оператор поставив уточнюючі питання або перефразував проблему клієнта, щоб переконатися, що правильно зрозумів суть.
+
+3) Проявив ввічливість і емпатію
+Вимога: у мові є ввічливі формулювання, підтримка, спокійний доброзичливий тон.
+Якщо сухо, без підтримки — 0.
+
+4) Не перебивав, не говорив агресивно
+Вимога: не чути ознак агресії, різкості, тиску, перебивання.
+Якщо з транскрипту це неясно — став 0.
+
+5) Правильно надав відповідь / рішення
+Вимога: відповідь відповідає суті питання, є конкретне рішення або чітке пояснення, що буде зроблено.
+
+6) Пояснив наступні дії або строки
+Вимога: озвучено конкретні наступні кроки або строки.
+Фрази типу "найближчим часом", "скоро", "очікуйте" без строку — це 0.
+
+7) Запропонував допомогу наприкінці
+Вимога: перед завершенням оператор запитав, чи може ще чимось допомогти, або запропонував додаткову допомогу / доречний upsell.
+
+8) Подякував і завершив розмову коректно
+Вимога: тепле завершення з подякою, наприклад:
+"Дякую за звернення, гарного дня, до побачення".
+Сухе завершення без подяки — 0.
+
+Додатково:
+- summary має бути у форматі:
+  "Клієнт звернувся з [коротка причина]. Оператор [що зробив / яке рішення запропонував]."
+- root_reason = коротка реальна причина звернення абонента
+- resolved_on_first_contact = true, якщо питання реально вирішили в межах дзвінка;
+  false, якщо потрібен виїзд, ескалація, зворотний зв’язок чи очікування;
+  null, якщо з транскрипту неясно.
+- repeat_contact_signal = true, якщо клієнт прямо каже, що звертається повторно, або це очевидно з контексту.
+- churn_risk = high, якщо клієнт говорить про відключення, перехід до конкурента, розірвання договору або дуже незадоволений;
+  medium, якщо є сильне невдоволення;
+  low — решта.
+- customer_emotion = calm|annoyed|angry|frustrated|neutral
+- next_step_promised = що саме оператор пообіцяв далі
+- deadline_promised = конкретна дата/час/строк, якщо був
+- coaching.top_issues: тільки недоліки оператора, не тема дзвінка.
+  Якщо суттєвих недоліків немає: ["Немає суттєвих зауважень", "—"].
 
 Контекст:
 - Тривалість дзвінка (сек): {call_duration_sec if call_duration_sec is not None else "невідомо"}
@@ -540,8 +610,8 @@ OUTRO:
         payload = {
             "model": OPENAI_CHAT_MODEL,
             "messages": messages,
-            "temperature": 0.12,
-            "max_tokens": 1200,
+            "temperature": 0.1,
+            "max_tokens": 1400,
             "response_format": {"type": "json_object"},
         }
         r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
@@ -555,8 +625,23 @@ OUTRO:
         if not isinstance(obj, dict):
             return False, "root not object"
 
-        if "facts" not in obj or not isinstance(obj["facts"], dict):
+        facts = obj.get("facts")
+        if not isinstance(facts, dict):
             return False, "facts missing or not object"
+
+        required_fact_keys = [
+            "operator_introduced_self",
+            "operator_named_company",
+            "clarified_issue",
+            "showed_empathy",
+            "gave_solution",
+            "mentioned_deadline",
+            "offered_extra_help",
+            "closed_politely",
+        ]
+        for k in required_fact_keys:
+            if k not in facts or not isinstance(facts[k], bool):
+                return False, f"facts.{k} invalid"
 
         cl = obj.get("checklist")
         if not isinstance(cl, list) or len(cl) != 8:
@@ -566,13 +651,13 @@ OUTRO:
             if not isinstance(item, dict):
                 return False, f"checklist[{i}] not object"
 
-            st = item.get("status")
+            sc = item.get("score")
             note = item.get("note")
             ev = item.get("evidence", "")
             conf = item.get("confidence")
 
-            if st not in ("ok", "partial", "fail"):
-                return False, f"checklist[{i}].status invalid"
+            if sc not in (0, 1):
+                return False, f"checklist[{i}].score invalid"
 
             if not isinstance(note, str):
                 return False, f"checklist[{i}].note not string"
@@ -580,7 +665,6 @@ OUTRO:
             if len(note_s) < 6 or len(note_s) > 220:
                 return False, f"checklist[{i}].note bad length"
 
-            # note не може дорівнювати назві критерію
             if _norm_ws(note_s) == _norm_ws(labels[i]):
                 return False, f"checklist[{i}].note equals label"
 
@@ -594,12 +678,8 @@ OUTRO:
             if conf < 0 or conf > 1:
                 return False, f"checklist[{i}].confidence out of range"
 
-            if float(conf) < 0.6 and st == "ok":
-                return False, f"checklist[{i}] ok with low confidence"
-
-            # Додатково: сумнівне ok теж не ок
-            if float(conf) < 0.75 and st == "ok":
-                return False, f"checklist[{i}] ok with conf<0.75"
+            if sc == 1 and float(conf) < 0.75:
+                return False, f"checklist[{i}] score=1 with conf<0.75"
 
             if note_s.lower() in ("так", "ні", "ок", "добре"):
                 return False, f"checklist[{i}] trivial note"
@@ -611,6 +691,34 @@ OUTRO:
         summary = obj.get("summary")
         if not isinstance(summary, str) or len(summary.strip()) < 10:
             return False, "summary too short"
+
+        root_reason = obj.get("root_reason")
+        if not isinstance(root_reason, str) or len(root_reason.strip()) < 3:
+            return False, "root_reason invalid"
+
+        roc = obj.get("resolved_on_first_contact")
+        if roc not in (True, False, None):
+            return False, "resolved_on_first_contact invalid"
+
+        rcs = obj.get("repeat_contact_signal")
+        if not isinstance(rcs, bool):
+            return False, "repeat_contact_signal invalid"
+
+        churn_risk = obj.get("churn_risk")
+        if churn_risk not in ("low", "medium", "high"):
+            return False, "churn_risk invalid"
+
+        emotion = obj.get("customer_emotion")
+        if emotion not in ("calm", "annoyed", "angry", "frustrated", "neutral"):
+            return False, "customer_emotion invalid"
+
+        nsp = obj.get("next_step_promised")
+        if not isinstance(nsp, str):
+            return False, "next_step_promised invalid"
+
+        dp = obj.get("deadline_promised")
+        if not isinstance(dp, str):
+            return False, "deadline_promised invalid"
 
         coaching = obj.get("coaching")
         if not isinstance(coaching, dict):
@@ -628,15 +736,24 @@ OUTRO:
         if not isinstance(risk_flags, list) or not all(isinstance(x, str) for x in risk_flags):
             return False, "risk_flags invalid"
 
-        # Страховка: top_issues не має бути темою дзвінка
-        bad_topic_tokens = ("немає інтернет", "закінчил", "кошти", "рахунок", "тариф", "оплат", "поповнен")
+        bad_topic_tokens = (
+            "немає інтернет",
+            "закінчил",
+            "кошти",
+            "рахунок",
+            "тариф",
+            "оплат",
+            "поповнен",
+            "вайфай",
+            "роутер",
+            "швидкіст",
+        )
         ti_join = " ".join([_norm_ws(x) for x in top_issues if isinstance(x, str)])
         if any(tok in ti_join for tok in bad_topic_tokens) and "немає суттєвих зауважень" not in ti_join:
             return False, "coaching.top_issues looks like call topic"
 
         return True, ""
 
-    # 1-й виклик
     obj = _call_openai(_build_messages())
     ok, _ = _validate(obj)
 
@@ -645,9 +762,10 @@ OUTRO:
             _build_messages(
                 fix_note=(
                     "Попередня відповідь порушила формат/якість. "
-                    "Суворо: note НЕ може повторювати назву критерію; "
+                    "Суворо: checklist рівно 8 елементів; score тільки 0 або 1; "
+                    "score=1 лише при confidence >= 0.75; "
                     "coaching.top_issues — лише недоліки оператора, не тема дзвінка; "
-                    "8 елементів checklist; low confidence => не ok; без зайвих ключів."
+                    "поверни всі обов'язкові поля без зайвих ключів."
                 )
             )
         )
@@ -657,14 +775,14 @@ OUTRO:
             return (
                 "❌ Не вдалося отримати валідний аналіз (формат/якість порушено).",
                 "Не вдалося отримати структуроване резюме (fallback).",
-                "Інше",
+                "Інформаційні звернення",
                 0,
                 {"error": "invalid_format"},
             )
 
     cl = obj["checklist"]
     summary = (obj.get("summary") or "").strip()
-    tag = obj.get("tag") or "Інше"
+    tag = obj.get("tag") or "Інформаційні звернення"
     coaching = obj.get("coaching") or {}
     risks = obj.get("risk_flags") or []
 
@@ -672,18 +790,17 @@ OUTRO:
     score = 0
 
     for i, item in enumerate(cl):
-        st = item.get("status")
+        sc = item.get("score", 0)
         note = (item.get("note") or "").strip()
         ev = (item.get("evidence") or "").strip()
         conf = float(item.get("confidence") or 0.0)
 
-        emoji = status_to_emoji.get(st, "⚠️")
-        if st == "ok":
+        emoji = "✅" if sc == 1 else "❌"
+        if sc == 1:
             score += 1
 
-        # conf показуємо тільки якщо: не ok або сумнівно (<0.8)
         conf_str = ""
-        if st != "ok" or conf < 0.8:
+        if sc == 0 or conf < 0.8:
             conf_str = f" (conf {conf:.2f})"
 
         lines.append(f"{emoji} {labels[i]}: {note}{conf_str}")
@@ -694,7 +811,6 @@ OUTRO:
     checklist_html = "\n".join(html_escape(x) if not x.strip().startswith("<i>") else x for x in lines)
     summary_html = html_escape(summary if summary else "Немає короткого резюме.")
 
-    # coaching
     coach_block = ""
     try:
         ti = coaching.get("top_issues") or []
@@ -709,7 +825,6 @@ OUTRO:
     except Exception:
         coach_block = ""
 
-    # risks
     risk_block = ""
     if risks:
         risk_block = "\n\n<b>Ризики:</b>\n" + "\n".join([f"• {html_escape(x)}" for x in risks[:6]])
@@ -832,6 +947,30 @@ def _week_bounds_kyiv(now: datetime) -> tuple[datetime, datetime]:
     return start_kyiv.astimezone(ZoneInfo("UTC")), end_kyiv.astimezone(ZoneInfo("UTC"))
 
 
+def _safe_parse_dt(val: str) -> t.Optional[datetime]:
+    if not val:
+        return None
+    try:
+        s = str(val).strip()
+        s = s.replace("T", " ")
+        s = s.replace("/", "-")
+        fmts = [
+            "%Y-%m-%d %H:%M:%S",
+            "%d.%m.%Y %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%d.%m.%Y %H:%M",
+        ]
+        for fmt in fmts:
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt.replace(tzinfo=ZoneInfo(WEEKLY_TZ)).astimezone(ZoneInfo("UTC"))
+            except Exception:
+                pass
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(ZoneInfo("UTC"))
+    except Exception:
+        return None
+
+
 def _send_weekly_report():
     now = _now_kyiv()
     start_utc, end_utc = _week_bounds_kyiv(now)
@@ -840,8 +979,10 @@ def _send_weekly_report():
     window = []
     for it in calls:
         try:
-            ts = datetime.fromisoformat(it.get("ts").replace("Z", "+00:00"))
-            if start_utc <= ts <= end_utc:
+            call_dt = _safe_parse_dt(it.get("call_start", ""))
+            if call_dt is None:
+                call_dt = datetime.fromisoformat(it.get("ts").replace("Z", "+00:00"))
+            if start_utc <= call_dt <= end_utc:
                 window.append(it)
         except Exception:
             continue
@@ -854,15 +995,68 @@ def _send_weekly_report():
     avg_dur = round(sum(it.get("duration", 0) or 0 for it in window) / total, 1)
     avg_score = round(sum(it.get("score", 0) or 0 for it in window) / total, 2)
 
-    tag_counts = Counter((it.get("tag") or "Інше") for it in window)
-    top_tags = tag_counts.most_common(5)
+    tag_counts = Counter((it.get("tag") or "Інформаційні звернення") for it in window)
+    top_tags = tag_counts.most_common(10)
     tags_block = "\n".join([f"• {html_escape(t)} — {n}" for t, n in top_tags]) or "• —"
 
-    worst = sorted(window, key=lambda x: (x.get("score", 0), x.get("duration", 0)))[:3]
+    reason_counts = Counter((it.get("root_reason") or "—") for it in window)
+    top_reasons = reason_counts.most_common(5)
+    reasons_block = "\n".join([f"• {html_escape(r)} — {n}" for r, n in top_reasons]) or "• —"
+
+    resolved_true = sum(1 for it in window if it.get("resolved_on_first_contact") is True)
+    resolved_known = sum(1 for it in window if it.get("resolved_on_first_contact") in (True, False))
+    fcr_rate = round((resolved_true / resolved_known) * 100, 1) if resolved_known else 0.0
+
+    repeat_count = sum(1 for it in window if it.get("repeat_contact_signal") is True)
+    repeat_rate = round((repeat_count / total) * 100, 1) if total else 0.0
+
+    churn_count = sum(1 for it in window if it.get("churn_risk") == "high")
+    churn_rate = round((churn_count / total) * 100, 1) if total else 0.0
+
+    criteria_names = [
+        "Привітання по скрипту",
+        "З’ясування суті",
+        "Емпатія",
+        "Без агресії / перебивань",
+        "Правильне рішення",
+        "Наступні дії / строки",
+        "Запропонував допомогу",
+        "Коректне завершення",
+    ]
+    criteria_totals = [0] * 8
+    criteria_count = 0
+
+    for it in window:
+        scores = it.get("criteria_scores") or []
+        if len(scores) == 8:
+            for i, sc in enumerate(scores):
+                try:
+                    criteria_totals[i] += int(sc)
+                except Exception:
+                    pass
+            criteria_count += 1
+
+    criteria_block = "• —"
+    if criteria_count:
+        crit_stats = []
+        for i, total_sc in enumerate(criteria_totals):
+            pct = round((total_sc / criteria_count) * 100, 1)
+            crit_stats.append((criteria_names[i], pct))
+        crit_stats = sorted(crit_stats, key=lambda x: x[1])[:5]
+        criteria_block = "\n".join([f"• {html_escape(name)} — {pct}%" for name, pct in crit_stats])
+
+    worst = sorted(
+        window,
+        key=lambda x: (
+            x.get("score", 0),
+            x.get("trust", {}).get("overall", 0),
+            x.get("duration", 0) or 0,
+        ),
+    )[:5]
     worst_block = "\n".join(
         [
-            f"• {html_escape(it.get('name','—'))} | {html_escape(it.get('phone','—'))} | "
-            f"тег: {html_escape(it.get('tag','—'))} | бал: {int(it.get('score',0))}"
+            f"• {html_escape(it.get('name', '—'))} | {html_escape(_mask_phone(it.get('phone', '—')))} | "
+            f"тег: {html_escape(it.get('tag', '—'))} | бал: {int(it.get('score', 0))}"
             for it in worst
         ]
     ) or "• —"
@@ -872,8 +1066,13 @@ def _send_weekly_report():
         f"<b>{title}</b>\n"
         f"Дзвінків: <b>{total}</b>\n"
         f"Середня тривалість: <b>{avg_dur}s</b>\n"
-        f"Середній бал якості (0–8): <b>{avg_score}</b>\n\n"
+        f"Середній бал якості (0–8): <b>{avg_score}</b>\n"
+        f"FCR (закрито з 1-го контакту): <b>{fcr_rate}%</b>\n"
+        f"Повторні звернення: <b>{repeat_rate}%</b>\n"
+        f"Ризик відтоку: <b>{churn_rate}%</b>\n\n"
         f"<b>Топ тем:</b>\n{tags_block}\n\n"
+        f"<b>Топ причин звернень:</b>\n{reasons_block}\n\n"
+        f"<b>Найслабші критерії команди:</b>\n{criteria_block}\n\n"
         f"<b>Топ проблемні (найнижчий бал):</b>\n{worst_block}"
     )
     tg_send_message(body)
@@ -881,7 +1080,25 @@ def _send_weekly_report():
     try:
         csv_path = pathlib.Path(CSV_FILENAME)
         with csv_path.open("w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["ts", "call_id", "name", "phone", "duration", "tag", "score", "summary", "trust"])
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "ts",
+                    "call_start",
+                    "call_id",
+                    "name",
+                    "phone",
+                    "duration",
+                    "tag",
+                    "root_reason",
+                    "score",
+                    "resolved_on_first_contact",
+                    "repeat_contact_signal",
+                    "churn_risk",
+                    "summary",
+                    "trust",
+                ],
+            )
             w.writeheader()
             for it in window:
                 summary_plain = (it.get("summary_plain") or it.get("summary") or "")
@@ -890,12 +1107,17 @@ def _send_weekly_report():
                 w.writerow(
                     {
                         "ts": it.get("ts", ""),
+                        "call_start": it.get("call_start", ""),
                         "call_id": it.get("call_id", ""),
                         "name": it.get("name", ""),
                         "phone": it.get("phone", ""),
                         "duration": it.get("duration", ""),
                         "tag": it.get("tag", ""),
+                        "root_reason": it.get("root_reason", ""),
                         "score": it.get("score", ""),
+                        "resolved_on_first_contact": it.get("resolved_on_first_contact", ""),
+                        "repeat_contact_signal": it.get("repeat_contact_signal", ""),
+                        "churn_risk": it.get("churn_risk", ""),
                         "summary": summary_plain,
                         "trust": overall,
                     }
@@ -965,7 +1187,6 @@ def process():
                 transcript, call_duration_sec=c.duration
             )
 
-            # Trust
             transcript_trust = compute_transcript_trust(transcript, c.duration)
             analysis_trust = compute_analysis_trust(analysis_obj if isinstance(analysis_obj, dict) else {})
             overall_trust = compute_overall_trust(transcript_trust, analysis_trust)
@@ -976,6 +1197,17 @@ def process():
                 f"| transcript {transcript_trust}% | analysis {analysis_trust}%"
             )
 
+            root_reason = str(analysis_obj.get("root_reason") or "—")
+            resolved = analysis_obj.get("resolved_on_first_contact")
+            repeat_signal = bool(analysis_obj.get("repeat_contact_signal", False))
+            churn_risk = str(analysis_obj.get("churn_risk") or "low")
+            customer_emotion = str(analysis_obj.get("customer_emotion") or "neutral")
+            next_step_promised = str(analysis_obj.get("next_step_promised") or "")
+            deadline_promised = str(analysis_obj.get("deadline_promised") or "")
+
+            resolved_text = _to_bool_text_ua(resolved)
+            repeat_text = "так" if repeat_signal else "ні"
+
             header = f"AI: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{c.duration}s"
             body = (
                 f"<b>Новий дзвінок</b>\n"
@@ -985,13 +1217,26 @@ def process():
                 f"<b>Початок:</b> {html_escape(c.call_start)}\n"
                 f"<b>Тривалість:</b> {c.duration}s\n"
                 f"<b>Тема:</b> {html_escape(tag)} | <b>Бал:</b> {score}/8\n"
-                f"{trust_line}\n\n"
-                f"<b>Аналіз розмови:</b>\n{checklist_html}\n\n"
+                f"<b>Причина звернення:</b> {html_escape(root_reason)}\n"
+                f"<b>Питання закрито з 1-го контакту:</b> {html_escape(resolved_text)}\n"
+                f"<b>Повторне звернення:</b> {html_escape(repeat_text)}\n"
+                f"<b>Ризик відтоку:</b> {html_escape(churn_risk)}\n"
+                f"<b>Емоція клієнта:</b> {html_escape(customer_emotion)}\n"
+                f"{trust_line}\n"
+            )
+
+            if next_step_promised:
+                body += f"<b>Наступний крок:</b> {html_escape(next_step_promised)}\n"
+            if deadline_promised:
+                body += f"<b>Озвучений строк:</b> {html_escape(deadline_promised)}\n"
+
+            body += (
+                f"\n<b>Аналіз розмови:</b>\n{checklist_html}\n\n"
                 f"<b>Коротке резюме:</b> {summary_html}"
             )
+
             tg_send_message(f"{header}\n\n{body}")
 
-            # позначаємо обробленим (черга)
             processed_list.append(c.call_id)
             processed_set.add(c.call_id)
             if len(processed_list) > PROCESSED_KEEP:
@@ -1003,9 +1248,17 @@ def process():
 
             summary_plain = _strip_html(summary_html)
 
+            checklist = analysis_obj.get("checklist") if isinstance(analysis_obj, dict) else []
+            criteria_scores = []
+            if isinstance(checklist, list):
+                for it in checklist[:8]:
+                    if isinstance(it, dict):
+                        criteria_scores.append(int(it.get("score", 0)))
+
             _append_call_record(
                 {
                     "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "call_start": c.call_start,
                     "call_id": c.call_id,
                     "name": name,
                     "phone": phone,
@@ -1015,6 +1268,14 @@ def process():
                     "summary": summary_html,
                     "summary_plain": summary_plain,
                     "analysis": analysis_obj,
+                    "root_reason": root_reason,
+                    "resolved_on_first_contact": analysis_obj.get("resolved_on_first_contact"),
+                    "repeat_contact_signal": bool(analysis_obj.get("repeat_contact_signal", False)),
+                    "churn_risk": str(analysis_obj.get("churn_risk") or "low"),
+                    "customer_emotion": str(analysis_obj.get("customer_emotion") or "neutral"),
+                    "next_step_promised": str(analysis_obj.get("next_step_promised") or ""),
+                    "deadline_promised": str(analysis_obj.get("deadline_promised") or ""),
+                    "criteria_scores": criteria_scores,
                     "trust": {
                         "overall": overall_trust,
                         "transcript": transcript_trust,
