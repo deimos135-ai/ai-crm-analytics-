@@ -45,7 +45,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 LIMIT_LAST = int(os.getenv("LIMIT_LAST", "10"))
 
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5o")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
