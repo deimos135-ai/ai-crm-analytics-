@@ -1,62 +1,59 @@
 #!/usr/bin/env python3
 """
-Bitrix24 -> Whisper -> Telegram monitor (real-time, weekly analytics, safe import)
-
-Оновлено під нові вимоги:
-- 8 QA критеріїв у форматі binary score 0/1
-- 10 тем звернень
-- Додаткові бізнес-метрики:
-  - root_reason
-  - resolved_on_first_contact
-  - repeat_contact_signal
-  - churn_risk
-  - customer_emotion
-  - next_step_promised
-  - deadline_promised
-- Розширений weekly report:
-  - FCR
-  - повторні звернення
-  - ризик відтоку
-  - топ причин звернень
-  - найслабші критерії команди
+Bitrix24 -> OpenAI Transcribe -> Telegram monitor
+Оновлена версія:
+- новіша транскрипція: gpt-4o-transcribe / gpt-4o-mini-transcribe
+- окрема модель для аналізу: gpt-5-mini (або інша через env)
+- оновлені QA-критерії без вимоги називати компанію
+- прибрано слабкий критерій про перебивання
+- requests.Session + retry
+- акуратніше сегментування транскрипту
+- weekly analytics збережено
 """
 
 import os
 import re
 import json
+import csv
+import time
 import pathlib
 import traceback
 import typing as t
 from dataclasses import dataclass
-
-import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import csv
 from collections import Counter
+
+import requests
 
 
 # -------------------- Config --------------------
 STATE_FILE = os.getenv("STATE_FILE", "b24_monitor_state.json")
-BITRIX_WEBHOOK_BASE = os.getenv("BITRIX_WEBHOOK_BASE", "")  # must end with '/'
+BITRIX_WEBHOOK_BASE = os.getenv("BITRIX_WEBHOOK_BASE", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+
 LIMIT_LAST = int(os.getenv("LIMIT_LAST", "10"))
 
 LANGUAGE_HINT = (os.getenv("LANGUAGE_HINT") or "uk").strip().lower()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
-TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
+
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+OPENAI_ANALYSIS_MODEL = os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5-mini")
+
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "90"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
 
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
-MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "7000"))
+MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "0"))  # 0 = no hard cut
 
 ONLY_INCOMING = (os.getenv("ONLY_INCOMING", "true").lower() == "true")
-INCOMING_CODE = os.getenv("INCOMING_CODE", "1")  # 1=incoming, 2=outgoing
+INCOMING_CODE = os.getenv("INCOMING_CODE", "1")
 MIN_DURATION_SEC = int(os.getenv("MIN_DURATION_SEC", "10"))
 
 WEEKLY_TZ = os.getenv("WEEKLY_TZ", "Europe/Kyiv")
-WEEKLY_REPORT_DAY = os.getenv("WEEKLY_REPORT_DAY", "Fri")  # Mon..Sun (strftime %a)
+WEEKLY_REPORT_DAY = os.getenv("WEEKLY_REPORT_DAY", "Fri")
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "18"))
 WEEKLY_KEEP_DAYS = int(os.getenv("WEEKLY_KEEP_DAYS", "35"))
 
@@ -70,7 +67,11 @@ PROCESSED_KEEP = int(os.getenv("PROCESSED_KEEP", "800"))
 if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith("/"):
     BITRIX_WEBHOOK_BASE += "/"
 
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "ai-crm-analytics/2.0"})
 
+
+# -------------------- Data --------------------
 @dataclass
 class CallItem:
     id: str
@@ -85,30 +86,39 @@ class CallItem:
     call_type: t.Optional[str]
 
 
-# -------------------- Utils --------------------
+# -------------------- Text / utils --------------------
+QA_LABELS = [
+    "Привітався та представився",
+    "Чітко з’ясував суть звернення",
+    "Використовував ввічливі та підтримувальні формулювання",
+    "Говорив професійно та по суті",
+    "Правильно надав відповідь / рішення",
+    "Пояснив наступні дії або строки",
+    "Запропонував допомогу наприкінці",
+    "Подякував і завершив розмову коректно",
+]
+
+ALLOWED_TAGS = [
+    "Технічні проблеми",
+    "Тарифи",
+    "Дорого / заперечення по ціні",
+    "Підключення",
+    "Платежі / рахунок",
+    "Скарги",
+    "Повторні звернення",
+    "Ризик відтоку / утримання",
+    "Інформаційні звернення",
+    "Продаж / допродаж",
+    "Організаційні питання",
+]
+
+
 def html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def http_post_json(url: str, payload: dict) -> dict:
-    resp = requests.post(url, json=payload, timeout=TIMEOUT)
-    if resp.status_code >= 400:
-        print(f"[http] {resp.status_code} POST {url} -> {resp.text[:2000]}", flush=True)
-        resp.raise_for_status()
-    return resp.json()
-
-
-def _require_env(name: str) -> bool:
-    val = os.getenv(name, "")
-    if not val:
-        print(f"[monitor] WARN missing env {name}", flush=True)
-        return False
-    return True
-
-
 def _strip_html(s: str) -> str:
-    s = (s or "")
-    return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return (s or "").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
 
 
 def _norm_ws(s: str) -> str:
@@ -134,6 +144,73 @@ def _mask_phone(phone: str) -> str:
     return phone or "—"
 
 
+def _require_env(name: str) -> bool:
+    val = os.getenv(name, "")
+    if not val:
+        print(f"[monitor] WARN missing env {name}", flush=True)
+        return False
+    return True
+
+
+# -------------------- HTTP helpers --------------------
+def _sleep_backoff(attempt: int) -> None:
+    time.sleep(1.2 * (attempt + 1))
+
+
+def post_with_retry(
+    url: str,
+    *,
+    headers: t.Optional[dict] = None,
+    json_body: t.Optional[dict] = None,
+    data: t.Optional[dict] = None,
+    files: t.Optional[dict] = None,
+    timeout: int = 60,
+    retries: int = 2,
+) -> requests.Response:
+    last_err = None
+
+    for attempt in range(retries + 1):
+        try:
+            resp = SESSION.post(
+                url,
+                headers=headers,
+                json=json_body,
+                data=data,
+                files=files,
+                timeout=timeout,
+            )
+
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"Retryable status: {resp.status_code}", response=resp)
+
+            if resp.status_code >= 400:
+                try:
+                    body = resp.text[:2000]
+                except Exception:
+                    body = "<no body>"
+                print(f"[http] {resp.status_code} POST {url} -> {body}", flush=True)
+
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_err = e
+            if attempt >= retries:
+                raise
+            _sleep_backoff(attempt)
+
+    raise last_err  # pragma: no cover
+
+
+def http_post_json(url: str, payload: dict) -> dict:
+    resp = post_with_retry(
+        url,
+        json_body=payload,
+        timeout=HTTP_TIMEOUT,
+        retries=OPENAI_MAX_RETRIES,
+    )
+    return resp.json()
+
+
 # -------------------- Trust metrics --------------------
 def compute_transcript_trust(transcript: str, duration_sec: t.Optional[int]) -> int:
     if not transcript:
@@ -144,9 +221,8 @@ def compute_transcript_trust(transcript: str, duration_sec: t.Optional[int]) -> 
         return int(round(_clamp((len(transcript) / 1200) * 100, 20, 95)))
 
     minutes = duration_sec / 60.0
-    expected = max(30, int(minutes * 120))
+    expected = max(30, int(minutes * 110))
     ratio = _clamp(words / expected, 0.0, 1.2)
-
     trust = 100 * _clamp(ratio / 0.9, 0.0, 1.0)
     return int(round(trust))
 
@@ -156,24 +232,18 @@ def compute_analysis_trust(analysis_obj: dict) -> int:
     if not isinstance(cl, list) or not cl:
         return 0
 
-    contrib = []
+    confs = []
     for it in cl:
         if not isinstance(it, dict):
             continue
-        score = it.get("score")
         conf = it.get("confidence")
-        if score not in (0, 1):
-            continue
-        if not isinstance(conf, (int, float)):
-            conf = 0.0
+        if isinstance(conf, (int, float)):
+            confs.append(float(conf))
 
-        base = 1.0 if score == 1 else 0.7
-        contrib.append(base * float(conf))
-
-    if not contrib:
+    if not confs:
         return 0
 
-    avg = sum(contrib) / len(contrib)
+    avg = sum(confs) / len(confs)
     return int(round(100 * _clamp(avg, 0.0, 1.0)))
 
 
@@ -208,6 +278,7 @@ def b24_vox_get_total() -> int:
 def b24_vox_get_latest(limit: int) -> t.List[CallItem]:
     total = b24_vox_get_total()
     start = max(total - limit, 0)
+
     url = f"{BITRIX_WEBHOOK_BASE}voximplant.statistic.get.json"
     data = {"ORDER": {"CALL_START_DATE": "DESC"}, "LIMIT": limit, "start": start}
     js = http_post_json(url, data)
@@ -266,6 +337,7 @@ def _portal_base_from_webhook() -> str:
 def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
     if not entity_type or not entity_id:
         return "—"
+
     et = entity_type.upper()
     method = None
     if et == "CONTACT":
@@ -276,12 +348,14 @@ def b24_get_entity_name(entity_type: str, entity_id: str) -> str:
         method = "crm.company.get.json"
     else:
         return "—"
+
     try:
         js = http_post_json(f"{BITRIX_WEBHOOK_BASE}{method}", {"ID": str(entity_id)})
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
         print(f"[b24] name fetch failed {code}: {e}", flush=True)
         return "—"
+
     data = js.get("result", {}) or {}
     parts = []
     for k in ("NAME", "SECOND_NAME", "LAST_NAME"):
@@ -311,11 +385,12 @@ def b24_entity_link(entity_type: str, entity_id: str, activity_id: t.Optional[st
 
 # -------------------- Audio fetch --------------------
 def fetch_audio(url: str, max_mb: int = 25) -> tuple[bytes, str, str]:
-    headers = {"User-Agent": "ai-crm-analytics/1.0", "Accept": "*/*"}
+    headers = {"Accept": "*/*"}
     max_bytes = max_mb * 1024 * 1024
 
-    with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=TIMEOUT) as r:
+    with SESSION.get(url, headers=headers, stream=True, allow_redirects=True, timeout=HTTP_TIMEOUT) as r:
         r.raise_for_status()
+
         mime = (r.headers.get("Content-Type", "").split(";")[0].strip().lower())
         clen = r.headers.get("Content-Length")
 
@@ -345,6 +420,10 @@ def fetch_audio(url: str, max_mb: int = 25) -> tuple[bytes, str, str]:
             mime = "audio/wav"
         elif lower.endswith(".m4a"):
             mime = "audio/mp4"
+        elif lower.endswith(".ogg"):
+            mime = "audio/ogg"
+        elif lower.endswith(".webm"):
+            mime = "audio/webm"
         else:
             if len(data) < 1024:
                 raise RuntimeError(f"Unexpected content-type '{mime}' and tiny body ({len(data)} bytes)")
@@ -360,6 +439,10 @@ def fetch_audio(url: str, max_mb: int = 25) -> tuple[bytes, str, str]:
         filename += ".wav"
     elif ".m4a" in url.lower():
         filename += ".m4a"
+    elif ".ogg" in url.lower():
+        filename += ".ogg"
+    elif ".webm" in url.lower():
+        filename += ".webm"
     else:
         ext = {
             "audio/mpeg": ".mp3",
@@ -376,47 +459,59 @@ def fetch_audio(url: str, max_mb: int = 25) -> tuple[bytes, str, str]:
     return data, mime, filename
 
 
-# -------------------- OpenAI: Whisper --------------------
-def transcribe_whisper(audio_bytes: bytes, filename: str = "audio.mp3", mime: str = "audio/mpeg") -> str:
+# -------------------- OpenAI: transcription --------------------
+def transcribe_audio(audio_bytes: bytes, filename: str = "audio.mp3", mime: str = "audio/mpeg") -> str:
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
     initial_prompt = (
-        "Транскрибуй українською мовою (uk). Дотримуйся української орфографії, "
-        "без російських літер і кальок. Приклади: «будь ласка», «зв'язок», "
-        "«підключення», «номер». Не змішуй українську та російську."
+        "Транскрибуй українською мовою. "
+        "Зберігай природну українську орфографію. "
+        "Коректно розпізнавай слова: тариф, рахунок, підключення, заявка, майстер, "
+        "роутер, інтернет, швидкість, договір, абонент, номер, оплата."
     )
 
     files = {"file": (filename, audio_bytes, mime)}
     data = {
-        "model": "whisper-1",
-        "language": LANGUAGE_HINT,
+        "model": OPENAI_TRANSCRIBE_MODEL,
+        "language": LANGUAGE_HINT or "uk",
         "temperature": 0,
         "prompt": initial_prompt,
     }
 
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=TIMEOUT)
-    if r.status_code >= 400:
-        try:
-            err = r.json()
-        except Exception:
-            err = r.text
-        raise requests.HTTPError(f"OpenAI audio/transcriptions {r.status_code}: {err}")
-    return (r.json().get("text", "") or "").strip()
+    r = post_with_retry(
+        url,
+        headers=headers,
+        data=data,
+        files=files,
+        timeout=OPENAI_TIMEOUT,
+        retries=OPENAI_MAX_RETRIES,
+    )
+
+    js = r.json()
+    return (js.get("text", "") or "").strip()
 
 
-# -------------------- Analysis helpers --------------------
+# -------------------- Transcript helpers --------------------
+def _trim_segment(s: str, limit: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= limit else s[:limit].rstrip() + "…"
+
+
 def _segment_transcript(text: str) -> dict:
     ttxt = (text or "").strip()
     if not ttxt:
         return {"intro": "", "middle": "", "outro": ""}
 
+    if MAX_TRANSCRIPT_CHARS > 0 and len(ttxt) > MAX_TRANSCRIPT_CHARS:
+        ttxt = ttxt[:MAX_TRANSCRIPT_CHARS].rstrip() + "…"
+
     n = len(ttxt)
-    intro_len = min(1200, n)
-    outro_len = min(1200, max(0, n - intro_len))
+    intro_len = min(1800, n)
+    outro_len = min(1800, max(0, n - intro_len))
 
     intro = ttxt[:intro_len].strip()
-    outro = ttxt[-outro_len:].strip() if outro_len > 0 else ttxt[-min(600, n):].strip()
+    outro = ttxt[-outro_len:].strip() if outro_len > 0 else ttxt[-min(900, n):].strip()
 
     if n <= intro_len + outro_len + 50:
         middle = ttxt[intro_len:].strip()
@@ -425,65 +520,44 @@ def _segment_transcript(text: str) -> dict:
         mid_end = min(n - outro_len, (n // 2) + 1200)
         middle = ttxt[mid_start:mid_end].strip()
 
-    return {"intro": intro, "middle": middle, "outro": outro}
+    return {
+        "intro": _trim_segment(intro, 1800),
+        "middle": _trim_segment(middle, 2400),
+        "outro": _trim_segment(outro, 1800),
+    }
 
 
-# -------------------- OpenAI: Ultimate analysis --------------------
+# -------------------- OpenAI: analysis --------------------
 def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = None) -> tuple[str, str, str, int, dict]:
-    """
-    Повертає:
-      (html_checklist, html_summary, tag, score_0_8, analysis_obj)
-    """
     if not transcript:
-        return ("Немає транскрипту для аналізу.", "Немає даних для резюме.", "Інформаційні звернення", 0, {"error": "empty_transcript"})
-
-    if MAX_TRANSCRIPT_CHARS > 0 and len(transcript) > MAX_TRANSCRIPT_CHARS:
-        transcript = transcript[:MAX_TRANSCRIPT_CHARS] + " …(урізано для економії токенів)"
+        return (
+            "Немає транскрипту для аналізу.",
+            "Немає даних для резюме.",
+            "Інформаційні звернення",
+            0,
+            {"error": "empty_transcript"},
+        )
 
     seg = _segment_transcript(transcript)
 
-    allowed_tags = [
-        "Технічні проблеми",
-        "Тарифи",
-        "Підключення",
-        "Платежі / рахунок",
-        "Скарги",
-        "Повторні звернення",
-        "Ризик відтоку / утримання",
-        "Інформаційні звернення",
-        "Продаж / допродаж",
-        "Організаційні питання",
-    ]
-
-    labels = [
-        "Привітався по скрипту",
-        "Чітко з’ясував суть звернення",
-        "Проявив ввічливість і емпатію",
-        "Не перебивав, не говорив агресивно",
-        "Правильно надав відповідь / рішення",
-        "Пояснив наступні дії або строки",
-        "Запропонував допомогу наприкінці",
-        "Подякував і завершив розмову коректно",
-    ]
-
-    def _build_messages(fix_note: str = ""):
+    def _build_messages(fix_note: str = "") -> list[dict]:
         system = (
             "Ти — провідний QA-аналітик кол-центру. "
             "Відповідай ТІЛЬКИ УКРАЇНСЬКОЮ. "
             "ПОВЕРТАЙ СУВОРО JSON без тексту поза JSON. "
-            "ЗАБОРОНЕНО вигадувати факти: якщо ознаки немає в тексті або вона нечітка — став 0. "
+            "НЕ вигадуй факти. Якщо ознаки немає в тексті або вона нечітка — став 0. "
             "Оцінка по кожному критерію тільки 0 або 1. "
             "1 = критерій чітко виконаний і є підтвердження в тексті. "
             "0 = не виконаний, сумнівний або бракує доказів. "
             "Якщо не впевнений — став 0. "
-            "Якщо з транскрипту не видно, чи оператор перебивав, — став 0 по критерію про перебивання. "
             "Поверни рівно такий JSON-об'єкт:\n"
             "{\n"
             "  \"facts\": {\n"
+            "    \"operator_greeted\": true,\n"
             "    \"operator_introduced_self\": true,\n"
-            "    \"operator_named_company\": true,\n"
             "    \"clarified_issue\": true,\n"
             "    \"showed_empathy\": true,\n"
+            "    \"spoke_professionally\": true,\n"
             "    \"gave_solution\": true,\n"
             "    \"mentioned_deadline\": false,\n"
             "    \"offered_extra_help\": false,\n"
@@ -514,7 +588,7 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
             "  },\n"
             "  \"risk_flags\": [\"...\"]\n"
             "}\n"
-            f"Дозволені tag: {', '.join(allowed_tags)}. "
+            f"Дозволені tag: {', '.join(ALLOWED_TAGS)}. "
             "Пріоритет tag при змішаних темах: "
             "1) Ризик відтоку / утримання, "
             "2) Повторні звернення, "
@@ -536,37 +610,37 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
 Зроби аналіз ВХІДНОГО дзвінка за 8 критеріями у заданому форматі.
 
 Критерії (порядок незмінний):
-1) Привітався по скрипту
-Вимога: оператор чітко назвав себе і компанію, бажано у формі:
-"Добрий день, мене звати [Ім’я], компанія [назва]. Чим можу допомогти?"
-Якщо назвав тільки ім’я без компанії — 0.
-Якщо привітання формальне або неповне — 0.
+1) Привітався та представився
+Вимога: оператор привітався і назвав своє ім’я або представився у зрозумілій формі.
+Називати компанію НЕ обов’язково.
+Якщо є лише сухий початок без представлення — 0.
 
 2) Чітко з’ясував суть звернення
-Вимога: оператор поставив уточнюючі питання або перефразував проблему клієнта, щоб переконатися, що правильно зрозумів суть.
+Вимога: оператор поставив уточнюючі питання або перефразував проблему клієнта,
+щоб переконатися, що правильно зрозумів суть.
 
 3) Проявив ввічливість і емпатію
 Вимога: у мові є ввічливі формулювання, підтримка, спокійний доброзичливий тон.
 Якщо сухо, без підтримки — 0.
 
-4) Не перебивав, не говорив агресивно
-Вимога: не чути ознак агресії, різкості, тиску, перебивання.
-Якщо з транскрипту це неясно — став 0.
+4) Говорив професійно та по суті
+Вимога: відповіді оператора були доречні, без грубості, без хаосу, з фокусом на рішенні.
+Якщо це неможливо впевнено оцінити з тексту — 0.
 
 5) Правильно надав відповідь / рішення
 Вимога: відповідь відповідає суті питання, є конкретне рішення або чітке пояснення, що буде зроблено.
 
 6) Пояснив наступні дії або строки
 Вимога: озвучено конкретні наступні кроки або строки.
-Фрази типу "найближчим часом", "скоро", "очікуйте" без строку — це 0.
+Фрази типу "найближчим часом", "скоро", "очікуйте" без конкретного строку — це 0.
 
 7) Запропонував допомогу наприкінці
-Вимога: перед завершенням оператор запитав, чи може ще чимось допомогти, або запропонував додаткову допомогу / доречний upsell.
+Вимога: перед завершенням оператор запитав, чи може ще чимось допомогти,
+або запропонував додаткову доречну допомогу / upsell.
 
 8) Подякував і завершив розмову коректно
-Вимога: тепле завершення з подякою, наприклад:
-"Дякую за звернення, гарного дня, до побачення".
-Сухе завершення без подяки — 0.
+Вимога: тепле завершення з подякою або коректною прощальною формулою.
+Сухе завершення без подяки чи нормального завершення — 0.
 
 Додатково:
 - summary має бути у форматі:
@@ -575,8 +649,10 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
 - resolved_on_first_contact = true, якщо питання реально вирішили в межах дзвінка;
   false, якщо потрібен виїзд, ескалація, зворотний зв’язок чи очікування;
   null, якщо з транскрипту неясно.
-- repeat_contact_signal = true, якщо клієнт прямо каже, що звертається повторно, або це очевидно з контексту.
-- churn_risk = high, якщо клієнт говорить про відключення, перехід до конкурента, розірвання договору або дуже незадоволений;
+- repeat_contact_signal = true, якщо клієнт прямо каже, що звертається повторно,
+  або це очевидно з контексту.
+- churn_risk = high, якщо клієнт говорить про відключення, перехід до конкурента,
+  розірвання договору або дуже незадоволений;
   medium, якщо є сильне невдоволення;
   low — решта.
 - customer_emotion = calm|annoyed|angry|frustrated|neutral
@@ -604,20 +680,27 @@ OUTRO:
 """
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-    def _call_openai(messages):
+    def _call_openai_json(messages: list[dict]) -> dict:
         url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
         payload = {
-            "model": OPENAI_CHAT_MODEL,
+            "model": OPENAI_ANALYSIS_MODEL,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 1400,
+            "max_tokens": 1600,
             "response_format": {"type": "json_object"},
         }
-        r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT)
-        if r.status_code >= 400:
-            print(f"[openai] chat {r.status_code} -> {r.text[:2000]}", flush=True)
-        r.raise_for_status()
+
+        r = post_with_retry(
+            url,
+            headers=headers,
+            json_body=payload,
+            timeout=OPENAI_TIMEOUT,
+            retries=OPENAI_MAX_RETRIES,
+        )
         content = r.json()["choices"][0]["message"]["content"]
         return json.loads(content)
 
@@ -630,10 +713,11 @@ OUTRO:
             return False, "facts missing or not object"
 
         required_fact_keys = [
+            "operator_greeted",
             "operator_introduced_self",
-            "operator_named_company",
             "clarified_issue",
             "showed_empathy",
+            "spoke_professionally",
             "gave_solution",
             "mentioned_deadline",
             "offered_extra_help",
@@ -665,7 +749,7 @@ OUTRO:
             if len(note_s) < 6 or len(note_s) > 220:
                 return False, f"checklist[{i}].note bad length"
 
-            if _norm_ws(note_s) == _norm_ws(labels[i]):
+            if _norm_ws(note_s) == _norm_ws(QA_LABELS[i]):
                 return False, f"checklist[{i}].note equals label"
 
             if not isinstance(ev, str):
@@ -685,7 +769,7 @@ OUTRO:
                 return False, f"checklist[{i}] trivial note"
 
         tag = obj.get("tag")
-        if tag not in allowed_tags:
+        if tag not in ALLOWED_TAGS:
             return False, "tag not allowed"
 
         summary = obj.get("summary")
@@ -738,8 +822,6 @@ OUTRO:
 
         bad_topic_tokens = (
             "немає інтернет",
-            "закінчил",
-            "кошти",
             "рахунок",
             "тариф",
             "оплат",
@@ -754,14 +836,14 @@ OUTRO:
 
         return True, ""
 
-    obj = _call_openai(_build_messages())
+    obj = _call_openai_json(_build_messages())
     ok, _ = _validate(obj)
 
     if not ok:
-        obj = _call_openai(
+        obj = _call_openai_json(
             _build_messages(
                 fix_note=(
-                    "Попередня відповідь порушила формат/якість. "
+                    "Попередня відповідь порушила формат або якість. "
                     "Суворо: checklist рівно 8 елементів; score тільки 0 або 1; "
                     "score=1 лише при confidence >= 0.75; "
                     "coaching.top_issues — лише недоліки оператора, не тема дзвінка; "
@@ -774,13 +856,13 @@ OUTRO:
         if not ok:
             return (
                 "❌ Не вдалося отримати валідний аналіз (формат/якість порушено).",
-                "Не вдалося отримати структуроване резюме (fallback).",
+                "Не вдалося отримати структуроване резюме.",
                 "Інформаційні звернення",
                 0,
                 {"error": "invalid_format"},
             )
 
-    cl = obj["checklist"]
+    checklist = obj["checklist"]
     summary = (obj.get("summary") or "").strip()
     tag = obj.get("tag") or "Інформаційні звернення"
     coaching = obj.get("coaching") or {}
@@ -789,7 +871,7 @@ OUTRO:
     lines: list[str] = []
     score = 0
 
-    for i, item in enumerate(cl):
+    for i, item in enumerate(checklist):
         sc = item.get("score", 0)
         note = (item.get("note") or "").strip()
         ev = (item.get("evidence") or "").strip()
@@ -803,7 +885,7 @@ OUTRO:
         if sc == 0 or conf < 0.8:
             conf_str = f" (conf {conf:.2f})"
 
-        lines.append(f"{emoji} {labels[i]}: {note}{conf_str}")
+        lines.append(f"{emoji} {QA_LABELS[i]}: {note}{conf_str}")
 
         if SHOW_EVIDENCE_IN_TG and ev:
             lines.append(f"    <i>«{html_escape(ev)}»</i>")
@@ -830,7 +912,6 @@ OUTRO:
         risk_block = "\n\n<b>Ризики:</b>\n" + "\n".join([f"• {html_escape(x)}" for x in risks[:6]])
 
     checklist_html = checklist_html + coach_block + risk_block
-
     return checklist_html, summary_html, str(tag), int(score), obj
 
 
@@ -840,10 +921,11 @@ def tg_send_message(text: str) -> None:
         if TG_BOT_TOKEN.startswith("sk-"):
             print("[tg] ERROR: TG_BOT_TOKEN схожий на OpenAI ключ (sk-...). Замініть на токен BotFather.", flush=True)
             return
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
-        CHUNK = 3500
-        parts = [text[i : i + CHUNK] for i in range(0, len(text), CHUNK)] or [text]
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        chunk = 3500
+        parts = [text[i:i + chunk] for i in range(0, len(text), chunk)] or [text]
+
         for part in parts:
             payload = {
                 "chat_id": TG_CHAT_ID,
@@ -851,7 +933,7 @@ def tg_send_message(text: str) -> None:
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
-            r = requests.post(url, json=payload, timeout=TIMEOUT)
+            r = SESSION.post(url, json=payload, timeout=HTTP_TIMEOUT)
             if r.status_code >= 400:
                 print(f"[tg] sendMessage {r.status_code}: {r.text[:300]}", flush=True)
             r.raise_for_status()
@@ -859,16 +941,17 @@ def tg_send_message(text: str) -> None:
         traceback.print_exc()
 
 
-def _tg_send_document(path: str, caption: str = ""):
+def _tg_send_document(path: str, caption: str = "") -> None:
     try:
         if TG_BOT_TOKEN.startswith("sk-"):
             print("[tg] ERROR: TG_BOT_TOKEN виглядає як OpenAI ключ.", flush=True)
             return
+
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument"
         with open(path, "rb") as f:
             files = {"document": (path, f)}
             data = {"chat_id": TG_CHAT_ID, "caption": caption}
-            r = requests.post(url, data=data, files=files, timeout=TIMEOUT)
+            r = SESSION.post(url, data=data, files=files, timeout=HTTP_TIMEOUT)
             if r.status_code >= 400:
                 print(f"[tg] sendDocument {r.status_code}: {r.text[:300]}", flush=True)
             r.raise_for_status()
@@ -897,11 +980,14 @@ def _load_weekly_state() -> dict:
     return {}
 
 
-def _save_weekly_state(st: dict):
-    pathlib.Path(WEEKLY_STATE_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+def _save_weekly_state(st: dict) -> None:
+    pathlib.Path(WEEKLY_STATE_FILE).write_text(
+        json.dumps(st, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
-def _append_call_record(rec: dict):
+def _append_call_record(rec: dict) -> None:
     with open(CALLS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -911,6 +997,7 @@ def _read_calls() -> list[dict]:
     p = pathlib.Path(CALLS_FILE)
     if not p.exists():
         return res
+
     with p.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -923,12 +1010,14 @@ def _read_calls() -> list[dict]:
     return res
 
 
-def _prune_old_calls():
+def _prune_old_calls() -> None:
     if WEEKLY_KEEP_DAYS <= 0:
         return
+
     cutoff = datetime.utcnow() - timedelta(days=WEEKLY_KEEP_DAYS)
     items = _read_calls()
     keep = []
+
     for it in items:
         try:
             ts = datetime.fromisoformat(it.get("ts").replace("Z", "+00:00"))
@@ -936,6 +1025,7 @@ def _prune_old_calls():
                 keep.append(it)
         except Exception:
             keep.append(it)
+
     with open(CALLS_FILE, "w", encoding="utf-8") as f:
         for it in keep:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
@@ -951,9 +1041,7 @@ def _safe_parse_dt(val: str) -> t.Optional[datetime]:
     if not val:
         return None
     try:
-        s = str(val).strip()
-        s = s.replace("T", " ")
-        s = s.replace("/", "-")
+        s = str(val).strip().replace("T", " ").replace("/", "-")
         fmts = [
             "%Y-%m-%d %H:%M:%S",
             "%d.%m.%Y %H:%M:%S",
@@ -971,7 +1059,7 @@ def _safe_parse_dt(val: str) -> t.Optional[datetime]:
         return None
 
 
-def _send_weekly_report():
+def _send_weekly_report() -> None:
     now = _now_kyiv()
     start_utc, end_utc = _week_bounds_kyiv(now)
     calls = _read_calls()
@@ -1014,10 +1102,10 @@ def _send_weekly_report():
     churn_rate = round((churn_count / total) * 100, 1) if total else 0.0
 
     criteria_names = [
-        "Привітання по скрипту",
-        "З’ясування суті",
+        "Привітався та представився",
+        "З’ясував суть звернення",
         "Емпатія",
-        "Без агресії / перебивань",
+        "Професійність і фокус",
         "Правильне рішення",
         "Наступні дії / строки",
         "Запропонував допомогу",
@@ -1100,6 +1188,7 @@ def _send_weekly_report():
                 ],
             )
             w.writeheader()
+
             for it in window:
                 summary_plain = (it.get("summary_plain") or it.get("summary") or "")
                 trust = it.get("trust", {})
@@ -1127,7 +1216,7 @@ def _send_weekly_report():
         traceback.print_exc()
 
 
-def _maybe_send_weekly_report():
+def _maybe_send_weekly_report() -> None:
     st = _load_weekly_state()
     now = _now_kyiv()
     week_key = _iso_week_key(now)
@@ -1153,12 +1242,15 @@ def load_state() -> dict:
     return {}
 
 
-def save_state(st: dict):
-    pathlib.Path(STATE_FILE).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_state(st: dict) -> None:
+    pathlib.Path(STATE_FILE).write_text(
+        json.dumps(st, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 # -------------------- Main --------------------
-def process():
+def process() -> None:
     if not all(_require_env(n) for n in ["BITRIX_WEBHOOK_BASE", "OPENAI_API_KEY", "TG_BOT_TOKEN", "TG_CHAT_ID"]):
         return
 
@@ -1177,14 +1269,15 @@ def process():
 
         try:
             audio, mime, fname = fetch_audio(c.record_url, max_mb=MAX_AUDIO_MB)
-            transcript = transcribe_whisper(audio, filename=fname, mime=mime)
+            transcript = transcribe_audio(audio, filename=fname, mime=mime)
 
             name = b24_get_entity_name(c.crm_entity_type, c.crm_entity_id)
             phone = c.phone_number or "—"
             link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
             checklist_html, summary_html, tag, score, analysis_obj = analyze_and_summarize(
-                transcript, call_duration_sec=c.duration
+                transcript,
+                call_duration_sec=c.duration,
             )
 
             transcript_trust = compute_transcript_trust(transcript, c.duration)
@@ -1247,9 +1340,9 @@ def process():
             save_state(state)
 
             summary_plain = _strip_html(summary_html)
-
             checklist = analysis_obj.get("checklist") if isinstance(analysis_obj, dict) else []
             criteria_scores = []
+
             if isinstance(checklist, list):
                 for it in checklist[:8]:
                     if isinstance(it, dict):
@@ -1290,7 +1383,7 @@ def process():
                 "🚨 Помилка обробки CALL_ID "
                 f"<code>{html_escape(c.call_id)}</code>:\n"
                 f"<code>{html_escape(str(e))[:1200]}</code>\n"
-                "Підказка: 400 від OpenAI часто означає не-аудіо/HTML або занадто великий файл, "
+                "Підказка: 400 від OpenAI часто означає не-аудіо/HTML, занадто великий файл "
                 "або протухлий запис із Bitrix/Vox."
             )
 
