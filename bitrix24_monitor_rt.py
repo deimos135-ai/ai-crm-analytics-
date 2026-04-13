@@ -690,7 +690,7 @@ OUTRO:
 """
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-    ddef _call_openai(messages):
+    def _call_openai(messages):
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
