@@ -690,38 +690,47 @@ OUTRO:
 """
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-    def _call_openai(messages):
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    ddef _call_openai(messages):
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-        payload = {
-            "model": OPENAI_ANALYSIS_MODEL,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 1600,
-            "response_format": {"type": "json_object"},
-        }
+    payload = {
+        "model": OPENAI_ANALYSIS_MODEL,
+        "messages": messages,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
 
-        r = post_with_retry(
-            url,
-            headers=headers,
-            json_body=payload,
-            timeout=OPENAI_TIMEOUT,
-            retries=OPENAI_MAX_RETRIES,
+    model_name = (OPENAI_ANALYSIS_MODEL or "").lower()
+
+    if model_name.startswith("gpt-5") or model_name.startswith("o"):
+        payload["max_completion_tokens"] = 1600
+    else:
+        payload["max_tokens"] = 1600
+
+    r = post_with_retry(
+        url,
+        headers=headers,
+        json_body=payload,
+        timeout=OPENAI_TIMEOUT,
+        retries=OPENAI_MAX_RETRIES,
+    )
+
+    if r.status_code >= 400:
+        try:
+            err_body = r.text
+        except Exception:
+            err_body = "<no body>"
+        raise requests.HTTPError(
+            f"OpenAI chat/completions {r.status_code}: {err_body[:2500]}",
+            response=r,
         )
 
-        if r.status_code >= 400:
-            try:
-                err_body = r.text
-            except Exception:
-                err_body = "<no body>"
-            raise requests.HTTPError(
-                f"OpenAI chat/completions {r.status_code}: {err_body[:2500]}",
-                response=r,
-            )
-
-        content = r.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
+    content = r.json()["choices"][0]["message"]["content"]
+    return json.loads(content)
 
     def _validate(obj) -> tuple[bool, str]:
         if not isinstance(obj, dict):
