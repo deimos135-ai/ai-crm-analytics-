@@ -2,12 +2,11 @@
 """
 Bitrix24 -> OpenAI Transcribe -> Telegram monitor
 
-Фінальна версія:
-- транскрипція: gpt-4o-transcribe або gpt-4o-mini-transcribe
-- аналіз: gpt-4o або gpt-5-mini
-- стійка JSON-схема аналізу через criterion_key
-- новий тег: "Дорого / заперечення по ціні"
-- weekly report показує price objection
+v2:
+- стійкий checklist через criterion_key
+- м'яка валідація coaching.one_sentence_tip
+- skip повного QA при слабкому транскрипті
+- price objection у weekly report
 """
 
 import csv
@@ -45,6 +44,7 @@ OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
 
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "25"))
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "7000"))
+MIN_TRANSCRIPT_TRUST_FOR_FULL_QA = int(os.getenv("MIN_TRANSCRIPT_TRUST_FOR_FULL_QA", "45"))
 
 ONLY_INCOMING = (os.getenv("ONLY_INCOMING", "true").lower() == "true")
 INCOMING_CODE = os.getenv("INCOMING_CODE", "1")
@@ -66,7 +66,7 @@ if BITRIX_WEBHOOK_BASE and not BITRIX_WEBHOOK_BASE.endswith("/"):
     BITRIX_WEBHOOK_BASE += "/"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "ai-crm-analytics/3.0"})
+SESSION.headers.update({"User-Agent": "ai-crm-analytics/3.1"})
 
 
 # -------------------- QA constants --------------------
@@ -181,7 +181,10 @@ def post_with_retry(
                 timeout=timeout,
             )
             if resp.status_code in (429, 500, 502, 503, 504):
-                raise requests.HTTPError(f"Retryable status: {resp.status_code}: {resp.text[:1200]}", response=resp)
+                raise requests.HTTPError(
+                    f"Retryable status: {resp.status_code}: {resp.text[:1200]}",
+                    response=resp,
+                )
             return resp
         except Exception as e:
             last_err = e
@@ -611,9 +614,6 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
             "Якщо клієнт каже, що йому дорого, не влаштовує вартість, хоче дешевший тариф, просить знижку, "
             "не готовий платити стільки або порівнює ціну з дешевшими альтернативами — "
             "tag = 'Дорого / заперечення по ціні', а також price_objection = true. "
-            "Прикладами заперечення по ціні вважай фрази: "
-            "'дорого', 'занадто дорого', 'не хочу платити стільки', 'є дешевше', "
-            "'підберіть дешевший тариф', 'мене не влаштовує абонплата', 'хочу знижку'. "
             + (f" ДОДАТКОВО: {fix_note}" if fix_note else "")
         )
 
@@ -622,62 +622,25 @@ def analyze_and_summarize(transcript: str, call_duration_sec: t.Optional[int] = 
 
 Критерії:
 1) greeting_intro — Привітався та представився
-Вимога: оператор привітався і назвав своє ім’я або представився у зрозумілій формі.
-Називати компанію НЕ обов’язково.
-Якщо є лише сухий початок без представлення — 0.
-
 2) clarified_issue — Чітко з’ясував суть звернення
-Вимога: оператор поставив уточнюючі питання або перефразував проблему клієнта, щоб переконатися, що правильно зрозумів суть.
-
 3) polite_supportive — Використовував ввічливі та підтримувальні формулювання
-Вимога: у мові оператора є слова або фрази ввічливості, підтримки чи розуміння ситуації клієнта.
-Наприклад: "будь ласка", "дякую", "розумію вас", "перепрошую", "зараз допоможу", "мені шкода, що виникла така ситуація".
-Якщо таких мовних ознак немає — 0.
-
 4) professional_focus — Говорив професійно та по суті
-Вимога: відповіді оператора були доречні, структуровані та сфокусовані на вирішенні питання.
-Оцінюй тільки за текстом. Не оцінюй інтонацію, перебивання чи тон голосу, якщо це не видно зі слів.
-Якщо є явна грубість у формулюваннях — 0.
-Якщо грубість неочевидна з тексту, не роби негативного висновку лише через припущення.
-
 5) gave_solution — Правильно надав відповідь / рішення
-Вимога: відповідь відповідає суті питання, є конкретне рішення або чітке пояснення, що буде зроблено.
-
 6) next_steps_deadline — Пояснив наступні дії або строки
-Вимога: озвучено конкретні наступні кроки або строки.
-Фрази типу "найближчим часом", "скоро", "очікуйте" без конкретного строку — це 0.
-
 7) offered_extra_help — Запропонував допомогу наприкінці
-Вимога: перед завершенням оператор запитав, чи може ще чимось допомогти, або запропонував додаткову доречну допомогу / upsell.
-
 8) closed_politely — Подякував і завершив розмову коректно
-Вимога: тепле завершення з подякою або коректною прощальною формулою.
-Сухе завершення без подяки чи нормального завершення — 0.
 
-Додатково:
-- summary має бути у форматі:
+Правила:
+- називати компанію НЕ обов’язково
+- не оцінюй інтонацію або перебивання, якщо цього не видно з тексту
+- якщо даних недостатньо — став 0
+- summary у форматі:
   "Клієнт звернувся з [коротка причина]. Оператор [що зробив / яке рішення запропонував]."
-- root_reason = коротка реальна причина звернення абонента
-- resolved_on_first_contact = true, якщо питання реально вирішили в межах дзвінка;
-  false, якщо потрібен виїзд, ескалація, зворотний зв’язок чи очікування;
-  null, якщо з транскрипту неясно.
-- repeat_contact_signal = true, якщо клієнт прямо каже, що звертається повторно, або це очевидно з контексту.
-- price_objection = true, якщо клієнт прямо або по суті каже, що тариф / послуга / абонплата для нього дорогі,
-  просить дешевший варіант, знижку або каже, що не готовий платити таку суму.
-- price_objection_note = коротко опиши суть заперечення по ціні; якщо такого немає — "".
-- churn_risk = high, якщо клієнт говорить про відключення, перехід до конкурента, розірвання договору або дуже незадоволений;
-  medium, якщо є сильне невдоволення;
-  low — решта.
-- customer_emotion = calm|annoyed|angry|frustrated|neutral
-- next_step_promised = що саме оператор пообіцяв далі
-- deadline_promised = конкретна дата/час/строк, якщо був
-- coaching.top_issues: тільки недоліки оператора, не тема дзвінка.
-  Якщо суттєвих недоліків немає: ["Немає суттєвих зауважень", "—"].
 
 Контекст:
 - Тривалість дзвінка (сек): {call_duration_sec if call_duration_sec is not None else "невідомо"}
 
-Транскрипт (сегменти):
+Транскрипт:
 INTRO:
 ---
 {seg["intro"]}
@@ -737,9 +700,30 @@ OUTRO:
         content = r.json()["choices"][0]["message"]["content"]
         return json.loads(content)
 
+    def _normalize_coaching(obj: dict) -> None:
+        coaching = obj.get("coaching")
+        if not isinstance(coaching, dict):
+            obj["coaching"] = {
+                "top_issues": ["Немає суттєвих зауважень", "—"],
+                "one_sentence_tip": "Працюйте за структурою розмови та чітко фіксуйте наступні дії.",
+            }
+            return
+
+        top_issues = coaching.get("top_issues")
+        if not isinstance(top_issues, list) or len(top_issues) != 2 or not all(isinstance(x, str) for x in top_issues):
+            coaching["top_issues"] = ["Немає суттєвих зауважень", "—"]
+
+        tip = coaching.get("one_sentence_tip")
+        if not isinstance(tip, str):
+            tip = ""
+        tip = tip.strip()
+        coaching["one_sentence_tip"] = tip or "Працюйте за структурою розмови та чітко фіксуйте наступні дії."
+
     def _validate(obj: t.Any) -> tuple[bool, str]:
         if not isinstance(obj, dict):
             return False, "root not object"
+
+        _normalize_coaching(obj)
 
         facts = obj.get("facts")
         if not isinstance(facts, dict):
@@ -821,7 +805,7 @@ OUTRO:
             return False, "summary too short"
 
         root_reason = obj.get("root_reason")
-        if not isinstance(root_reason, str) or len(root_reason.strip()) < 3:
+        if not isinstance(root_reason, str) or len(root_reason.strip()) < 1:
             return False, "root_reason invalid"
 
         roc = obj.get("resolved_on_first_contact")
@@ -861,30 +845,16 @@ OUTRO:
             return False, "coaching missing"
 
         top_issues = coaching.get("top_issues")
-        tip = coaching.get("one_sentence_tip")
-
         if not isinstance(top_issues, list) or len(top_issues) != 2 or not all(isinstance(x, str) for x in top_issues):
             return False, "coaching.top_issues invalid"
-        if not isinstance(tip, str) or len(tip.strip()) < 10:
+
+        tip = coaching.get("one_sentence_tip")
+        if not isinstance(tip, str):
             return False, "coaching.one_sentence_tip invalid"
 
         risk_flags = obj.get("risk_flags")
         if not isinstance(risk_flags, list) or not all(isinstance(x, str) for x in risk_flags):
             return False, "risk_flags invalid"
-
-        bad_topic_tokens = (
-            "немає інтернет",
-            "рахунок",
-            "тариф",
-            "оплат",
-            "поповнен",
-            "вайфай",
-            "роутер",
-            "швидкіст",
-        )
-        ti_join = " ".join([_norm_ws(x) for x in top_issues if isinstance(x, str)])
-        if any(tok in ti_join for tok in bad_topic_tokens) and "немає суттєвих зауважень" not in ti_join:
-            return False, "coaching.top_issues looks like call topic"
 
         return True, ""
 
@@ -900,9 +870,7 @@ OUTRO:
                     "Суворо: checklist рівно 8 елементів; score тільки 0 або 1; "
                     "score=1 лише при confidence >= 0.75; "
                     "обов'язково поверни criterion_key для кожного пункту; "
-                    "усі 8 criterion_key мають бути присутні рівно один раз; "
-                    "coaching.top_issues — лише недоліки оператора, не тема дзвінка; "
-                    "поверни всі обов'язкові поля без зайвих ключів."
+                    "усі 8 criterion_key мають бути присутні рівно один раз."
                 )
             )
         )
@@ -910,12 +878,41 @@ OUTRO:
 
         if not ok:
             print(f"[analysis] second validation failed: {why}", flush=True)
+            fallback = {
+                "error": "invalid_format",
+                "checklist": [
+                    {
+                        "criterion_key": key,
+                        "score": 0,
+                        "note": "Недостатньо валідних даних для оцінки.",
+                        "evidence": "",
+                        "confidence": 0.0,
+                    }
+                    for key, _label in QA_CRITERIA
+                ],
+                "summary": "Не вдалося побудувати повне структуроване резюме.",
+                "tag": "Інформаційні звернення",
+                "root_reason": "Невідомо",
+                "resolved_on_first_contact": None,
+                "repeat_contact_signal": False,
+                "price_objection": False,
+                "price_objection_note": "",
+                "churn_risk": "low",
+                "customer_emotion": "neutral",
+                "next_step_promised": "",
+                "deadline_promised": "",
+                "coaching": {
+                    "top_issues": ["Недостатньо даних для оцінки", "—"],
+                    "one_sentence_tip": "Перевір якість транскрипту або запис дзвінка.",
+                },
+                "risk_flags": [],
+            }
             return (
-                "❌ Не вдалося отримати валідний аналіз (формат/якість порушено).",
-                "Не вдалося отримати структуроване резюме.",
+                "⚠️ Аналіз частково недоступний через невалідну структуру відповіді моделі.",
+                "Не вдалося побудувати повне структуроване резюме.",
                 "Інформаційні звернення",
                 0,
-                {"error": "invalid_format"},
+                fallback,
             )
 
     cl = obj["checklist"]
@@ -1312,6 +1309,30 @@ def save_state(st: dict) -> None:
     )
 
 
+def _build_low_transcript_message(
+    *,
+    name: str,
+    phone: str,
+    link: str,
+    call_start: str,
+    duration: t.Optional[int],
+    transcript_trust: int,
+) -> str:
+    header = f"AI: 📞 {html_escape(name)} | {html_escape(phone)} | ⏱{duration}s"
+    body = (
+        f"<b>Новий дзвінок</b>\n"
+        f"<b>ПІБ:</b> {html_escape(name)}\n"
+        f"<b>Телефон:</b> {html_escape(phone)}\n"
+        f"<b>CRM:</b> <a href='{html_escape(link)}'>відкрити</a>\n"
+        f"<b>Початок:</b> {html_escape(call_start)}\n"
+        f"<b>Тривалість:</b> {duration}s\n"
+        f"<b>Trust:</b> ❌ <b>{transcript_trust}%</b> (низька якість транскрипту)\n\n"
+        f"<b>Статус:</b> недостатньо якісний транскрипт для повного QA-аналізу.\n"
+        f"<b>Підказка:</b> перевір запис дзвінка або спробуй іншу модель транскрипції."
+    )
+    return f"{header}\n\n{body}"
+
+
 # -------------------- Main --------------------
 def process() -> None:
     if not all(_require_env(n) for n in ["BITRIX_WEBHOOK_BASE", "OPENAI_API_KEY", "TG_BOT_TOKEN", "TG_CHAT_ID"]):
@@ -1338,12 +1359,66 @@ def process() -> None:
             phone = c.phone_number or "—"
             link = b24_entity_link(c.crm_entity_type, c.crm_entity_id, c.crm_activity_id)
 
+            transcript_trust = compute_transcript_trust(transcript, c.duration)
+
+            if transcript_trust < MIN_TRANSCRIPT_TRUST_FOR_FULL_QA:
+                tg_send_message(
+                    _build_low_transcript_message(
+                        name=name,
+                        phone=phone,
+                        link=link,
+                        call_start=c.call_start,
+                        duration=c.duration,
+                        transcript_trust=transcript_trust,
+                    )
+                )
+
+                processed_list.append(c.call_id)
+                processed_set.add(c.call_id)
+                if len(processed_list) > PROCESSED_KEEP:
+                    processed_list = processed_list[-PROCESSED_KEEP:]
+                    processed_set = set(processed_list)
+
+                state["processed_call_ids"] = processed_list
+                save_state(state)
+
+                _append_call_record(
+                    {
+                        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        "call_start": c.call_start,
+                        "call_id": c.call_id,
+                        "name": name,
+                        "phone": phone,
+                        "duration": c.duration,
+                        "tag": "Інформаційні звернення",
+                        "score": 0,
+                        "summary": "Недостатньо якісний транскрипт для повного QA-аналізу.",
+                        "summary_plain": "Недостатньо якісний транскрипт для повного QA-аналізу.",
+                        "analysis": {"error": "low_transcript_trust"},
+                        "root_reason": "Невідомо",
+                        "resolved_on_first_contact": None,
+                        "repeat_contact_signal": False,
+                        "price_objection": False,
+                        "price_objection_note": "",
+                        "churn_risk": "low",
+                        "customer_emotion": "neutral",
+                        "next_step_promised": "",
+                        "deadline_promised": "",
+                        "criteria_scores": [0] * len(QA_CRITERIA),
+                        "trust": {
+                            "overall": 0,
+                            "transcript": transcript_trust,
+                            "analysis": 0,
+                        },
+                    }
+                )
+                continue
+
             checklist_html, summary_html, tag, score, analysis_obj = analyze_and_summarize(
                 transcript,
                 call_duration_sec=c.duration,
             )
 
-            transcript_trust = compute_transcript_trust(transcript, c.duration)
             analysis_trust = compute_analysis_trust(analysis_obj if isinstance(analysis_obj, dict) else {})
             overall_trust = compute_overall_trust(transcript_trust, analysis_trust)
             trust_emoji, trust_label = trust_badge(overall_trust)
